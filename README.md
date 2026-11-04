@@ -4,13 +4,13 @@
 （24 层 = 18 层 Gated DeltaNet + 6 层全注意力），权重走
 `bf16 → int8(PQWF 扩展) → guest blob`，在 Tile-NPU-Sim 上跑通并与 numpy 参考对拍。
 
-**当前状态一句话**（2026-11 在本机 Ubuntu 上重新验证）：端到端跑通
-（prefill 32 = 10,579,019 条动态指令，f32 状态读路径），
-**L0–L3 与参考逐位一致（rel ≈ 1.2e-7 ~ 2.4e-7，f32 舍入量级）**，L4 起因 int8
-量化决策在舍入边界上翻转而发散到 ~1e-2，最终 logits 与参考 **argmax 一致、
-top-10 完全重合、corr 0.996196**；**贪心生成 10 个 token 与参考逐个相同**
-（"The capital of France is" → " the capital of the country.\nThe capital of"）。
-详见 §6 的实测数据与"为什么不逐位"。
+**当前状态一句话**（2026-11 在本机 Ubuntu 上重新验证，**默认 i8 状态读**）：
+端到端跑通（prefill 32 = 10,865,392 条动态指令），**L0–L15 与参考逐位一致
+（rel ≈ 1.2e-7 ~ 1.6e-6，f32 舍入量级）**，L16 起因 int8 量化决策在舍入边界上
+翻转而发散到 ~1e-2，最终 logits 与参考 **argmax 一致、corr 0.996621、top-10 9/10**；
+**贪心生成 10 个 token 与参考逐个相同**（"The capital of France is" →
+" the capital of France.\nThe capital of France"）。
+（对拍时参考必须开 `--quant-state`，否则两边状态读方式不同、L0 就差 5e-2。）
 
 > **本轮（Ubuntu 迁移后）修了什么**：ISA 删除除法 / `mma.nn` / gather 索引改
 > u32 之后，算子与参考里有 5 处没跟上；另外 GDN 状态读的默认值被写成了 i8
@@ -34,7 +34,7 @@ top-10 完全重合、corr 0.996196**；**贪心生成 10 个 token 与参考逐
 | 2 | `attn256.h`、`gdn.h`、`mlp.h` | 大量 `div`（sigmoid/softmax 分母/silu）——ISA 已删除法 | 改成 `rcp.approx` + `mul`（模拟器里 rcp 就是精确 1/x） |
 | 3 | `embedding.h` | gather 索引向量 dtype 用 i32 | 新 ISA 要求 **u32**（`idv.set_dtype(U32)`） |
 | 4 | `include/tile.h` | `Tile::dequant` 用旧的回值签名（builtin 已改成 out 参数） | `void dequant(scale, Acc&)` |
-| 5 | **`gdn.h`** | `kGdnI8Read = true`（i8 状态读）——与参考的 f32 读不一致，逐层误差 5e-2 | 改成 `false`（README §7.1 的结论），逐层误差回到 1e-7 |
+| 5 | **`gdn.h` / `check_qwen35.py`** | 设备用 i8 状态读、参考却用 f32 读（`QUANT_STATE=False`）——两边不一致，L0 就差 5e-2 | 默认保持 i8（任务书 6.2 的原设计），参考加 `--quant-state` 对齐；此时 L0–L15 是 1e-7 量级 |
 
 **参考实现的修复**：`conv_causal` 在 `T<3` 时历史更新写错（把零补到末尾再取最后
 3 行，decode 的 T=1 拿到 `[新token,0,0]`），导致"增量 decode"与"整段重算"从 L0
@@ -176,11 +176,11 @@ hd=256 时输出方向有 **8 个 32 宽块**，所以 r0..r7 八个常驻 acc�
 
 | 项 | Qwen3.5-0.8B | 对照：Qwen3-0.6B |
 |---|---|---|
-| 静态指令数（`main.cpp` 汇编里 tab 开头的助记符行） | **59,395** | 40,178 |
-| guest 二进制 | **237,600 B** | 160,732 B |
+| 静态指令数（`main.cpp` 汇编里 tab 开头的助记符行） | **54,771** | 40,178 |
+| guest 二进制 | **219,104 B** | 160,732 B |
 | 权重 blob | 787,797,248 B（其中权重区 777 MB） | 791 MB |
-| prefill 32 token 动态指令数 | **10,579,019**（f32 状态读） | 2,369,787 |
-| prefill 5 token 动态指令数 | 4,273,180 | — |
+| prefill 32 token 动态指令数 | **10,865,392**（i8 状态读） | 2,369,787 |
+| prefill 5 token 动态指令数 | 4,434,435 | — |
 | 层数 / 参数量 | 24 层（18 GDN + 6 full），752.8 M | 28 层，596 M |
 
 prefill-32 是 0.6B 的 **4.24×**，来源大致是三块：
@@ -191,11 +191,11 @@ GDN 递推本身约 **2.4M** 条（= 编码器细节见下），约占 1/4。
 
 | 层 | 相对误差 | 说明 |
 |---|---|---|
-| L0 / L1 / L2（GDN） | 1.21e-7 / 1.65e-7 / 2.05e-7 | f32 舍入量级 |
-| L3（首个全注意力） | 2.41e-7 | 同上 |
-| L4 | 9.30e-3 | 开始发散（int8 舍入决策翻转） |
-| L7 / L11 / L19（全注意力） | 1.13e-2 / 2.00e-2 / 5.81e-2 | |
-| L23 | 7.33e-2 | |
+| L0 / L1 / L2（GDN） | 1.18e-7 / 1.44e-7 / 1.84e-7 | f32 舍入量级（i8 读 vs i8 读） |
+| L3（首个全注意力） | 1.90e-7 | 同上 |
+| L15 | 1.59e-6 | 仍是 f32 舍入 |
+| L16 | 5.78e-3 | 开始发散（int8 舍入决策翻转） |
+| L19 / L23 | 3.74e-2 / 6.74e-2 | |
 
 **L4 的跳变不是实现 bug**，是这套 W8A8 数值本身的灵敏度：
 
@@ -214,13 +214,13 @@ i32 累加部分已经是逐位一致的，见下）。
 ### 6.3 端到端 logits（5 token prompt，`check_qwen35.py`）
 
 ```
-max|Δ| 1.169   mean|Δ| 0.1771   |Δ| 中位数 0.1480   corr 0.996196
-argmax dev 279 / ref 279        top-10 重合 10/10
-|Δ| > 1.0 的 token: 7 / 248320
+max|Δ| 1.077   mean|Δ| 0.1708   |Δ| 中位数 0.1427   corr 0.996621
+argmax dev 279 / ref 279        top-10 重合 9/10
+|Δ| > 1.0 的 token: 3 / 248320
 ```
 
 贪心生成（prompt = `760, 6511, 314, 9338, 369`，即 "The capital of France is"）：
-设备与参考 **10 个 token 逐个相同** → `The capital of the country.\nThe capital of`。
+设备与参考 **10 个 token 逐个相同** → `The capital of France.\nThe capital of France`。
 
 top-5 对照（`279` = `" the"`）：
 
@@ -277,9 +277,12 @@ ref: ' the' 14.80  ' Paris'   14.25  ' located' 13.98  '\n' 13.73 ':' 13.60
 指令、不算带宽；而 i8 版的价值全在**带宽**上（36 MiB/chunk vs 2.2 GiB）。所以默认 f32，
 i8 版保留一行开关，等有带宽模型或真机时切换。
 
-> 迁移后的代码里这个开关曾被写成 `kGdnI8Read = true`（与参考的 f32 读不一致），
-> 表现为 L0 就有 5e-2 的逐层误差、端到端 corr 0.9934。改回 `false` 后 L0–L3
-> 回到 1e-7、corr 0.9962、top-10 10/10（§0 表 #5）。
+> **默认是 i8 读**（`kGdnI8Read = true`，任务书 6.2 的原设计）。对拍时参考必须
+> 开 `--quant-state`（`QUANT_STATE=True`）：两边都用 i8 读时 L0–L15 是 1e-7 量级、
+> 端到端 corr 0.9966、top-10 9/10、生成 10/10 个 token 相同；若参考用 f32 读而
+> 设备用 i8 读，L0 就差 5e-2（这是两条路径的差异，不是实现 bug）。
+> 改成 f32 读只需把 `kGdnI8Read` 设为 `false`（数值更好：corr 0.9962、
+> top-10 10/10，但状态访存大 48 倍）。
 
 **这段排查的最大收获是：三个"以为是后端 bug"的现象，最后全是我们自己的字节偏移错。**
 逐段验证（`sim_gdn_pred_guest.cpp`，384 条指令）证明指令语义都是对的：

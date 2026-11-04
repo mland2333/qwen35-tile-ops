@@ -74,6 +74,8 @@ def main() -> None:
     ap.add_argument("--extra-mib", default="64")
     ap.add_argument("--ref", default="quant", choices=("quant", "f32"))
     ap.add_argument("--pqw", default="build/qwen35-0.8b-int8.pqw")
+    ap.add_argument("--quant-state", action="store_true",
+                    help="参考的 GDN 状态读也走 i8（与 kGdnI8Read=true 的设备对拍）")
     ap.add_argument("--bridge", default=str(BRIDGE))
     ap.add_argument("--stages", action="store_true",
                     help="逐层比对残差流（需要 -DQ35_DUMP 构建的 guest）")
@@ -109,6 +111,9 @@ def main() -> None:
     ids = ids[:n]
     print(f"  输入 {n} 个 token: {ids[:8]}{'...' if n > 8 else ''}")
 
+    if a.quant_state:
+        R.QUANT_STATE = True
+        print("  参考：GDN 状态读 = i8（与设备的 kGdnI8Read=true 一致）")
     if a.ref == "quant":
         pqw = Path(a.pqw) if Path(a.pqw).is_absolute() else ROOT / a.pqw
         if pqw.is_file():

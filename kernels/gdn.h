@@ -381,9 +381,11 @@ YAI_OP_INLINE void copy_rows_f32(const MatrixView &dst, std::uint32_t d0,
 //   f32 版：逐层 1e-7（L0–L3 逐位级）、指令更少，但状态流量大。
 // 功能模拟器只数指令、不算带宽，所以这里默认 f32；真机上 i8 版才是对的
 // （任务书 6.2 的原设计）。切换只改这一行。
-// 默认 f32 读：i8 读（S 量化成 i8 再走 mma）在功能模拟器上逐层误差 5e-2，
-// f32 读是 1e-7（README §7.1 的实测对比）；真机上 i8 读的收益在带宽。
-inline constexpr bool kGdnI8Read = false;
+// 默认 i8 读（任务书 6.2 的原设计）：S 每个 token 量化成 i8 后走 mma，
+// 状态在整段 token 内不出寄存器；代价是逐层误差 ~5e-2（vs f32 读 1e-7），
+// 收益是状态访存从 T×4 MiB/层降到 ~2 MiB/层（与 chunk 长度无关）。
+// 对拍时参考要开 QUANT_STATE=True（check_qwen35.py --quant-state）。
+inline constexpr bool kGdnI8Read = true;
 
 YAI_OP_INLINE void gdn_recurrence_i8(const MatrixView &q8, const MatrixView &k8,
                                      const MatrixView &mix, const MatrixView &qscr,

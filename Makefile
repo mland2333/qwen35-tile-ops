@@ -91,8 +91,10 @@ $(BRIDGE): tools/sim_bridge.cpp $(TILE_NPU_SIM)/build/linux/x86_64/release/libsi
 
 bridge: $(BRIDGE)
 
+# 设备默认 i8 状态读（kGdnI8Read=true），参考要用 --quant-state 对齐；
+# 若把开关改成 false，去掉这里的 --quant-state 即可。
 check: $(GUEST) $(BLOB) $(BRIDGE)
-	$(PY) tools/check_qwen35.py --guest $(GUEST) --blob $(BLOB) --bridge $(BRIDGE)
+	$(PY) tools/check_qwen35.py --guest $(GUEST) --blob $(BLOB) --bridge $(BRIDGE) --quant-state
 
 chat: $(GUEST) $(BLOB) $(BRIDGE)
 	$(PY) tools/chat_qwen35.py "$(TEXT)" --max-new $(or $(MAX_NEW),16)

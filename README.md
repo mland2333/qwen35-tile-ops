@@ -484,7 +484,8 @@ flat 指令把它当作一条一维向量，**内部仍按 32 个元素一拍**�
 |---|---|---|---|
 | rmsnorm 32×1024（prefill） | 1113 | 790 | flat 丢掉了 32 行摊薄，只快 1.4× |
 | rmsnorm 1×1024（decode） | 1115 | **39** | 28.6×；一行一个 Acc，省掉 32 块循环与 31 次 vadd |
-| **embedding+rmsnorm 1 token** | **1662** | **57** | 词向量是连续一行，**完全不用 gather**：tload 1 KB → 寄存器内归一化，29× |
+| **embedding+rmsnorm 1 token**（decode） | **1662** | **57** | 词向量是连续一行，**完全不用 gather**：tload 1 KB → 寄存器内归一化，29× |
+| **embedding+rmsnorm 32 token**（prefill） | 1317（41/token） | **1022（32/token）** | 把 row_stride/cols/dtype/weight 提到循环外、每 token 只改 base，22% |
 | 词表 argmax（248320） | ~35 万/步 | — | 平铺后 243 次 flat.reduce.argmax |
 | 生成 5+10 token 总指令 | 42,673,902 | **39,134,089** | argmax + decode 融合，共省 8.3%，生成 token 逐个不变 |
 

@@ -484,8 +484,14 @@ flat 指令把它当作一条一维向量，**内部仍按 32 个元素一拍**�
 |---|---|---|---|
 | rmsnorm 32×1024（prefill） | 1113 | 790 | flat 丢掉了 32 行摊薄，只快 1.4× |
 | rmsnorm 1×1024（decode） | 1115 | **39** | 28.6×；一行一个 Acc，省掉 32 块循环与 31 次 vadd |
+| **embedding+rmsnorm 1 token** | **1662** | **57** | 词向量是连续一行，**完全不用 gather**：tload 1 KB → 寄存器内归一化，29× |
 | 词表 argmax（248320） | ~35 万/步 | — | 平铺后 243 次 flat.reduce.argmax |
-| 生成 5+10 token 总指令 | 42,673,902 | **39,279,804** | 只换 argmax 就省 8%，生成 token 逐个不变 |
+| 生成 5+10 token 总指令 | 42,673,902 | **39,134,089** | argmax + decode 融合，共省 8.3%，生成 token 逐个不变 |
+
+decode 的 embedding 走 `embedding_rmsnorm_row_flat`：一个 token 的词向量就是表里连续的一行
+（1024 i8 = 1 KB），把描述符 base 指到 `emb + id*1024`、`row_stride=32, col_stride=1`，一次
+`tload` 就是整条向量 —— **不需要 gather**。随后 `widen → acvt → ×scale`（残差流 x）和
+`flat.reduce.sumsq → ×1/rms → ×weight`（h2）都在同一个 Acc 里完成，残差流只写一次。
 
 两条路径**逐位相同**（rmsnorm 对拍 0/32768 个 bit 不同）：规约顺序都是"每 32 元素一棵树 + 顺序合并"。
 所以 flat 不需要改参考，也不会引入新的量化决策翻转。

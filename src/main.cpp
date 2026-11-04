@@ -380,8 +380,18 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
   const MatrixView lss = sub_view(w.lss, 0, 0, rows, 1);
 
   // ---- embedding（残差流的起点）----
+  // decode（1 token）时词向量是一行连续的 1024 i8，不需要 gather：直接
+  // tload 一行，并在同一个 Acc 上做完 rmsnorm（见 kernels/flat.h）。
   mark(w.blob, 10);
-  embedding_rows(w.emb, w.emb_s, ids_p, x);
+  if (rows == 1) {
+    // decode：词向量是一行连续的 1024 i8，直接 tload 一行（不用 gather），
+    // 在同一个 Acc 里做完第 0 层 pre-norm（顺带写残差流 x）。
+    const std::uint32_t tok = *reinterpret_cast<const std::uint32_t *>(w.ids.data + pos * 4);
+    const MatrixView n1_0{w.blob + mb::kLGN_BASE, 4, 4, H, 1, kDtF32};
+    embedding_rmsnorm_row_flat(w.emb, w.emb_s, tok, n1_0, x, h2, kInvH);
+  } else {
+    embedding_rows(w.emb, w.emb_s, ids_p, x);
+  }
   mark(w.blob, 11);
 #ifdef Q35_DUMP
   dump_f32(w.blob + mb::kDUMP,
@@ -407,7 +417,11 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
 
     // ---- 注意力子层 ----
     mark(w.blob, 20 + L * 4);
-    rmsnorm_rows(x, n1, h2, kInvH);
+    if (rows == 1 && L == 0) {
+      // decode：上面已经算好 h2 = norm(emb) 了
+    } else {
+      rmsnorm_rows(x, n1, h2, kInvH);
+    }
     quant_rows(h2, h8, hs);
     if (full) {
       full_layer(w, lw, ln, h8, hs, x, rows, pos, L);

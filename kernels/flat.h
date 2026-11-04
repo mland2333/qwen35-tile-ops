@@ -60,6 +60,75 @@ YAI_OP_INLINE void rmsnorm_rows_flat(const MatrixView &x, const MatrixView &w,
   }
 }
 
+
+// 单 token 的 embedding + rmsnorm 融合（decode 路径）。
+//
+// 一个 token 的词向量就是 embedding 表里**连续的一行**（1024 个 i8 = 1 KB），
+// 所以不需要 gather：把描述符的 base 指到 emb + id*1024、row_stride=32、
+// col_stride=1，一次 tload 就是整条 1024 向量。随后 widen/acvt/×scale 得到
+// 残差流 x，再在同一个 Acc 上做 flat rmsnorm 得到 h。
+YAI_OP_INLINE void embedding_rmsnorm_row_flat(const MatrixView &table,
+                                              const MatrixView &scale,
+                                              std::uint32_t id,
+                                              const MatrixView &w,
+                                              const MatrixView &out_x,
+                                              const MatrixView &out_h,
+                                              float inv) {
+  // 词表里连续的一行：1024 个 i8
+  Tile t{};
+  t.set_data(table.data + id * 1024);
+  t.set_strides(32, 1);
+  t.set_dtype(TileDType::I8);
+  t.set_valid_zone(32, 32);
+  t.load();
+
+  Acc a{};
+  a.set_strides(128, 4);
+  a.set_dtype(AccDType::I32);   // widen 的目的必须是 i32
+  a.set_valid_zone(32, 32);
+  a.set_layout_row_major();
+  t.widen(a);
+  a.to_fp32();                  // 之后 Acc 的配置是 f32
+  const std::uint32_t scale_bits =
+      *reinterpret_cast<const std::uint32_t *>(scale.data + id * 4);
+  a.mul(__builtin_bit_cast(float, scale_bits));
+
+  // 残差流起点 x
+  a.set_data(out_x.data);
+  a.set_strides(128, 4);
+  a.store();
+
+  // 整行 rmsnorm：weight 常驻一个 Acc
+  Acc wa{};
+  wa.set_data(w.data);
+  wa.set_strides(128, 4);
+  wa.set_dtype(AccDType::F32);
+  wa.set_valid_zone(32, 32);
+  wa.set_layout_row_major();
+  wa.load();
+  wa.set_layout_flat();
+
+  Vec32 ss{};
+  ss.set_dtype(Vec32DType::F32);
+  ss.set_stride(4);
+  set_len(ss, 1);
+
+  a.set_layout_flat();
+  a.reduce_flat_sumsq(ss);
+  ss.mul(inv);
+  ss.add(kEps);
+  ss.rsqrt();
+  a.mul_flat_scalar(ss);
+  a.mul_flat(wa);
+  a.set_layout_row_major();
+  a.set_data(out_h.data);
+  a.set_strides(128, 4);
+  a.store();
+  // 布局是"配置寄存器"的状态：离开函数前必须还原，否则后续复用同一物理
+  // 寄存器的 aload/astore 会带着 flat 布局、报 invalid_configuration。
+  wa.set_layout_row_major();
+}
+
 // 整行 argmax：每个 1024（32x32 连续）块用一条 flat.reduce.argmax，
 // 再与累计最优比较。返回全局下标。
 YAI_ALWAYS_INLINE std::uint32_t argmax_flat(const MatrixView &logits,

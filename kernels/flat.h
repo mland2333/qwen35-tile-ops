@@ -1,0 +1,109 @@
+#ifndef YAI_QWEN35_OPS_FLAT_H
+#define YAI_QWEN35_OPS_FLAT_H
+
+// ============================================================================
+// 平坦模式（layout = flat）的算子
+//
+// 一个 Acc 装 1024 个 f32，正好是 hidden 的一整行。flat 指令把它当作一条
+// 一维向量，按 32 个元素一拍做规约/逐元素，因此：
+//   * 整行 sumsq / absmax / argmax 是**一条指令**（内部 32 拍），
+//     而 row_major 路径要按 32 列分块，再做 31 次 vadd 合并；
+//   * 规约顺序是"每 32 元素一棵树，再顺序合并"，与 row_major 路径逐位相同。
+//
+// 只有 flat 白名单里的指令能在 flat 配置下执行；搬运/逐元素仍然用
+// row_major，所以每次切换要两条 cfg.setx（layout=1 / layout=0）。
+// ============================================================================
+#include "tile.h"
+
+#include "config.h"
+#include "io.h"
+#include "matrix.h"
+
+namespace qwen35_ops {
+
+// 整行（1024 = 32x32）rmsnorm：load → flat sumsq → ×1/rms → ×weight → store。
+// 权重按 32x32 常驻一个 Acc，跨行复用。
+YAI_OP_INLINE void rmsnorm_rows_flat(const MatrixView &x, const MatrixView &w,
+                                     const MatrixView &out, float inv) {
+  Vec32 ss{};
+  ss.set_dtype(Vec32DType::F32);
+  ss.set_stride(4);
+  set_len(ss, 1);
+
+  Acc wa{};
+  wa.set_data(w.data);
+  wa.set_strides(128, 4);   // 32x32 连续
+  wa.set_dtype(AccDType::F32);
+  wa.set_valid_zone(32, 32);
+  wa.load();
+  wa.set_layout_flat();
+
+  for (std::uint32_t m = 0; m < x.rows; ++m) {
+    Acc a{};
+    a.set_data(x.data + m * static_cast<std::uint32_t>(x.row_bytes));
+    a.set_strides(128, 4);
+    a.set_dtype(AccDType::F32);
+    a.set_valid_zone(32, 32);
+    a.set_layout_row_major();   // 上一轮可能停在同一物理寄存器的 flat 上
+    a.load();
+    a.set_layout_flat();
+    a.reduce_flat_sumsq(ss);
+    ss.mul(inv);
+    ss.add(kEps);
+    ss.rsqrt();
+    a.mul_flat_scalar(ss);
+    a.mul_flat(wa);
+    a.set_layout_row_major();
+    a.set_data(out.data + m * static_cast<std::uint32_t>(out.row_bytes));
+    a.set_strides(128, 4);
+    a.store();
+  }
+}
+
+// 整行 argmax：每个 1024（32x32 连续）块用一条 flat.reduce.argmax，
+// 再与累计最优比较。返回全局下标。
+YAI_ALWAYS_INLINE std::uint32_t argmax_flat(const MatrixView &logits,
+                                            const MatrixView &argf,
+                                            const MatrixView &argi) {
+  Vec32 mx{};
+  mx.set_dtype(Vec32DType::F32);
+  mx.set_stride(4);
+  set_len(mx, 1);
+  Vec32 ix{};
+  ix.set_dtype(Vec32DType::U32);
+  ix.set_stride(4);
+  set_len(ix, 1);
+
+  std::uint32_t best = 0;
+  std::uint32_t best_key = 0;
+  bool first = true;
+  for (std::uint32_t n = 0; n < logits.cols; n += 1024) {
+    const std::uint32_t rem = logits.cols - n;
+    const std::uint32_t len = rem >= 1024 ? 1024 : rem;   // 32 的倍数
+    Acc a{};
+    a.set_data(logits.data + n * 4);
+    a.set_strides(128, 4);
+    a.set_dtype(AccDType::F32);
+    a.set_valid_zone(static_cast<std::uint8_t>(len / 32), 32);
+    a.set_layout_row_major();
+    a.load();
+    a.set_layout_flat();
+    a.reduce_flat_argmax(ix, mx);
+    a.set_layout_row_major();
+    store_vec(mx, argf, 0);
+    store_vec(ix, argi, 0);
+    const std::uint32_t bits = *reinterpret_cast<const std::uint32_t *>(argf.data);
+    const std::uint32_t idx = *reinterpret_cast<const std::uint32_t *>(argi.data);
+    const std::uint32_t key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    if (first || key > best_key) {
+      best_key = key;
+      best = n + idx;
+      first = false;
+    }
+  }
+  return best;
+}
+
+} // namespace qwen35_ops
+
+#endif

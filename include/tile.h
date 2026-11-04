@@ -367,6 +367,15 @@ struct Acc {
   YAI_ALWAYS_INLINE Vec32 row_argmax() const;
   YAI_ALWAYS_INLINE void row_argmax(Vec32 &max_val, Vec32 &idx,
                                     std::int32_t col_base) const;
+  // ---- 平坦模式（layout = flat）：整条 len = rows*32 的向量 ----
+  // 只有这一组函数能在 flat 配置下使用；其它指令一律要求 row_major。
+  YAI_ALWAYS_INLINE void set_layout_flat();
+  YAI_ALWAYS_INLINE void set_layout_row_major();
+  YAI_ALWAYS_INLINE void reduce_flat_sumsq(Vec32 &v) const;
+  YAI_ALWAYS_INLINE void reduce_flat_max(Vec32 &v) const;
+  YAI_ALWAYS_INLINE void reduce_flat_argmax(Vec32 &idx, Vec32 &val) const;
+  YAI_ALWAYS_INLINE void mul_flat_scalar(const Vec32 &v);
+  YAI_ALWAYS_INLINE void mul_flat(const Acc &other);
 };
 
 struct Vec8 {
@@ -563,6 +572,35 @@ YAI_ALWAYS_INLINE void Acc::row_sum_sq(Vec32 &v) const {
 YAI_ALWAYS_INLINE void Acc::row_absmax(Vec32 &v) const {
   YAI_COMPILER_INTRINSIC(acc_row_absmax_merge)(value_, yai_handle(v));
 }
+YAI_ALWAYS_INLINE void Acc::set_layout_flat() {
+  YAI_COMPILER_INTRINSIC(acc_set_layout)(value_, 1);
+}
+
+YAI_ALWAYS_INLINE void Acc::set_layout_row_major() {
+  YAI_COMPILER_INTRINSIC(acc_set_layout)(value_, 0);
+}
+
+YAI_ALWAYS_INLINE void Acc::reduce_flat_sumsq(Vec32 &v) const {
+  YAI_COMPILER_INTRINSIC(acc_flat_reduce_sumsq)(value_, yai_handle(v));
+}
+
+YAI_ALWAYS_INLINE void Acc::reduce_flat_max(Vec32 &v) const {
+  YAI_COMPILER_INTRINSIC(acc_flat_reduce_max)(value_, yai_handle(v));
+}
+
+YAI_ALWAYS_INLINE void Acc::reduce_flat_argmax(Vec32 &idx, Vec32 &val) const {
+  YAI_COMPILER_INTRINSIC(acc_flat_reduce_argmax)(value_, yai_handle(idx),
+                                                 yai_handle(val));
+}
+
+YAI_ALWAYS_INLINE void Acc::mul_flat_scalar(const Vec32 &v) {
+  YAI_COMPILER_INTRINSIC(acc_flat_mul_scalar)(value_, yai_handle(v));
+}
+
+YAI_ALWAYS_INLINE void Acc::mul_flat(const Acc &other) {
+  YAI_COMPILER_INTRINSIC(acc_flat_mul)(value_, yai_handle(other));
+}
+
 YAI_ALWAYS_INLINE Vec32 Acc::row_argmax() const {
   return Vec32(YAI_COMPILER_INTRINSIC(acc_row_argmax)(value_));
 }

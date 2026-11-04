@@ -462,6 +462,34 @@ make stats
 ../../npucc/build/sim_bridge build/qwen35.bin build/qwen35_data32.bin /tmp/o.bin 0 4000000000 64
 ```
 
+## 10.5 平坦模式（layout = flat）
+
+`layout = flat` 是矩阵寄存器的附属布局：一个 Acc（1024×f32）正好是 hidden 的一整行，
+flat 指令把它当作一条一维向量，**内部仍按 32 个元素一拍**执行。只有 FLAT 指令族接受 flat
+操作数，其余指令一律要求 `row_major`（ISA/sim 双向校验）。
+
+| 指令 | 语义 | 在算子里的用途 |
+|---|---|---|
+| `flat.reduce.{sum,sumsq,max,min,absmax}` | 整条向量一个标量（每 32 元素一棵树 + 顺序合并） | rmsnorm 的整行 sumsq |
+| `flat.reduce.argmax` | 整条向量一个 `(index, value)` | 词表 argmax |
+| `flat.mulx` / `flat.mulv` | 整条向量 × 标量 / 逐元素乘 | ×1/rms、×weight |
+
+**tile 层 API**（`include/tile.h`，不新增类型）：`Acc::set_layout_flat()` /
+`set_layout_row_major()` / `reduce_flat_sumsq(Vec32&)` / `reduce_flat_argmax(Vec32&, Vec32&)` /
+`mul_flat_scalar(const Vec32&)` / `mul_flat(const Acc&)`。算子见 `kernels/flat.h`。
+
+实测（本机，功能模拟器按指令条数计）：
+
+| 用例 | row_major | flat | 说明 |
+|---|---|---|---|
+| rmsnorm 32×1024（prefill） | 1113 | 790 | flat 丢掉了 32 行摊薄，只快 1.4× |
+| rmsnorm 1×1024（decode） | 1115 | **39** | 28.6×；一行一个 Acc，省掉 32 块循环与 31 次 vadd |
+| 词表 argmax（248320） | ~35 万/步 | — | 平铺后 243 次 flat.reduce.argmax |
+| 生成 5+10 token 总指令 | 42,673,902 | **39,279,804** | 只换 argmax 就省 8%，生成 token 逐个不变 |
+
+两条路径**逐位相同**（rmsnorm 对拍 0/32768 个 bit 不同）：规约顺序都是"每 32 元素一棵树 + 顺序合并"。
+所以 flat 不需要改参考，也不会引入新的量化决策翻转。
+
 ## 11. 已知陷阱（本轮踩过的，都留在代码注释里）
 
 1. **loop-carried acc + `row_absmax` 静默归零**（§7.1）——最花时间的一个。

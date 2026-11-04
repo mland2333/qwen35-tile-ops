@@ -13,6 +13,7 @@
 // ============================================================================
 #include "../kernels/attn256.h"
 #include "../kernels/embedding.h"
+#include "../kernels/flat.h"
 #include "../kernels/qwen35.h"
 #include "model_qwen35.h"
 
@@ -476,27 +477,11 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
 // 贪心 argmax（对 logits 第 0 行）。跨 32 列块比较时把 f32 位模式映射成单调整型
 // key：-march=rv64im 没有 F 扩展，标量浮点比较会拉 libgcc 的软浮点 helper。
 YAI_ALWAYS_INLINE std::uint32_t argmax_logits(const ModelViews &w) {
+  // 平坦模式：每 1024 个 logit 装一个 Acc，一条 flat.reduce.argmax 出整个块
+  // 的最优 (idx, val)，再和累计值比较。和 row_major 版本逐位相同（规约顺序
+  // 都是"32 元素树 + 顺序合并"），但每块的指令数从 ~12 条降到 ~8 条。
   const MatrixView logits1 = sub_view(w.logits, 0, 0, 1, mb::kVocab);
-  std::uint32_t best = 0;
-  std::uint32_t best_key = 0;
-  bool first = true;
-  for (std::uint32_t n = 0; n < mb::kVocab; n += kBlock) {
-    Acc a{};
-    load_acc(a, logits1, 0, n);
-    Vec32 mx = a.row_max();
-    Vec32 ix = a.row_argmax();
-    store_vec(mx, w.argf, 0);
-    store_vec(ix, w.argi, 0);
-    const std::uint32_t bits = *reinterpret_cast<const std::uint32_t *>(w.argf.data);
-    const std::uint32_t idx = *reinterpret_cast<const std::uint32_t *>(w.argi.data);
-    const std::uint32_t key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-    if (first || key > best_key) {
-      best_key = key;
-      best = n + idx;
-      first = false;
-    }
-  }
-  return best;
+  return argmax_flat(logits1, w.argf, w.argi);
 }
 
 } // namespace qwen35_ops

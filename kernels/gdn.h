@@ -113,10 +113,9 @@ YAI_OP_INLINE void gdn_gates(const MatrixView &b, const MatrixView &a,
     t.mul(-1.0f);
     t.exp();
     t.add(1.0f);
-    set_zone(e, nr, nc);          // fill/div 都要用有效 zone（新建 acc 没有 zone）
-    e.fill(1.0f);
-    e.div(t);
-    store_acc_at(e, beta.data + m * static_cast<std::uint32_t>(beta.row_bytes));
+    // ISA 没有除法：1/(1+e^-b) 用 rcp.approx；t 的配置与 beta 相同，直接写回
+    t.rcp();
+    store_acc_at(t, beta.data + m * static_cast<std::uint32_t>(beta.row_bytes));
 
     // ---- x = a + dt_bias；w = |x| ----
     set_zone(t, nr, nc);
@@ -222,7 +221,8 @@ YAI_OP_INLINE void gdn_conv_silu(const MatrixView &buf, const MatrixView &cw,
       t.mul(-1.0f);
       t.exp();
       t.add(1.0f);
-      s.div(t);
+      t.rcp();                        // 1/(1+e^-s)
+      s.mul(t);                       // silu(s) = s/(1+e^-s)
       store_acc_at(s, mix.data + om);
     }
   }
@@ -381,7 +381,9 @@ YAI_OP_INLINE void copy_rows_f32(const MatrixView &dst, std::uint32_t d0,
 //   f32 版：逐层 1e-7（L0–L3 逐位级）、指令更少，但状态流量大。
 // 功能模拟器只数指令、不算带宽，所以这里默认 f32；真机上 i8 版才是对的
 // （任务书 6.2 的原设计）。切换只改这一行。
-inline constexpr bool kGdnI8Read = true;
+// 默认 f32 读：i8 读（S 量化成 i8 再走 mma）在功能模拟器上逐层误差 5e-2，
+// f32 读是 1e-7（README §7.1 的实测对比）；真机上 i8 读的收益在带宽。
+inline constexpr bool kGdnI8Read = false;
 
 YAI_OP_INLINE void gdn_recurrence_i8(const MatrixView &q8, const MatrixView &k8,
                                      const MatrixView &mix, const MatrixView &qscr,
@@ -724,13 +726,11 @@ YAI_OP_INLINE void gdn_gated_norm(const MatrixView &o32, const MatrixView &w,
       e.mul(-1.0f);
       e.exp();
       e.add(1.0f);                    // e = 1 + e^-z
-      set_zone(g, nr, nc);
-      g.fill(1.0f);
-      g.div(e);                       // g = sigmoid(z)
-      // silu(z) = z * sigmoid(z)：g 已是 sigmoid(z)，再乘一次 z
+      e.rcp();                        // e = sigmoid(z)（ISA 没有除法）
+      // silu(z) = z * sigmoid(z)
       set_zone(d, nr, nc);
       load_acc_at(d, z.data + oz);
-      d.mul(g);                       // d = silu(z)
+      d.mul(e);                       // d = silu(z)
       set_zone(g, nr, nc);
       load_acc_at(g, o32.data + od);  // g = norm(o)（覆盖 sigmoid）
       g.mul(d);                       // = norm(o) * silu(z)

@@ -66,7 +66,8 @@ YAI_OP_INLINE void swiglu(const MatrixView &gate, const MatrixView &up,
       e.mul(-1.0f);
       e.exp();
       e.add(1.0f);
-      g.div(e);
+      e.rcp();                        // 1/(1+e^-gate)（ISA 没有除法）
+      g.mul(e);
       g.mul(u);
       store_acc_at(g, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       n * static_cast<std::uint32_t>(out.col_bytes));

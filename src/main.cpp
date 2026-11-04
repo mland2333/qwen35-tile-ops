@@ -453,6 +453,10 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     } else if (L == 23) {
       dump_f32(w.blob + mb::kDUMP, 800000 + 2 * 34000, sub_view(w.x, 0, 0, rows, H));
     }
+    // --stages 用：每层残差流（slot 900000 + L*6000；只有小 prompt 装得下）
+    if (rows * static_cast<std::uint32_t>(H) <= 6000) {
+      dump_f32(w.blob + mb::kDUMP, 900000 + L * 6000, sub_view(w.x, 0, 0, rows, H));
+    }
 #endif
   }
 

@@ -33,9 +33,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 import ref_qwen35 as R                                    # noqa: E402
 
 MODEL_DIR = Path(os.environ.get(
-    "QWEN35_MODEL", ROOT.parent.parent / "qwen3.5-0.8b-bf16"))
-NPUCC = Path(os.environ.get("NPUCC", ROOT.parent.parent / "npucc"))
-BRIDGE = NPUCC / "build" / "sim_bridge"
+    "QWEN35_MODEL", ROOT.parent / "qwen3.5-0.8b-bf16"))
+BRIDGE = Path(os.environ.get("SIM_BRIDGE", ROOT / "build" / "sim_bridge"))
 PAD = 0x80000
 
 
@@ -45,17 +44,20 @@ def hdr_consts(path: Path) -> dict[str, int]:
             for m in re.finditer(r"inline constexpr (?:long|int) k(\w+) = (\d+);", txt)}
 
 
-def run_guest(guest: Path, blob: Path, out: Path, steps: str, extra_mib: str) -> str:
-    if not BRIDGE.is_file():
-        subprocess.run([sys.executable, str(NPUCC / "build_sim.py")], check=True)
+def run_guest(bridge: Path, guest: Path, blob: Path, out: Path, steps: str,
+              extra_mib: str) -> str:
+    del extra_mib  # kept for CLI compatibility: the bridge sizes RAM itself
+    if not bridge.is_file():
+        raise SystemExit(f"missing bridge: {bridge} (run 'make bridge')")
     data = blob.read_bytes()
     if len(data) < PAD:
         data += b"\x00" * (PAD - len(data))
     tmp = ROOT / "build" / "check_in.bin"
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_bytes(data)
-    r = subprocess.run([str(BRIDGE), str(guest), str(tmp), str(out), "0", steps,
-                        extra_mib], capture_output=True, text=True)
+    r = subprocess.run([str(bridge), str(guest), str(tmp), str(out),
+                        "--blob-base", "0x81000000", "--steps", steps],
+                       capture_output=True, text=True)
     sys.stdout.write("  sim: " + r.stdout.strip() + "\n")
     if r.returncode != 0:
         sys.stderr.write(r.stdout + r.stderr)
@@ -71,12 +73,15 @@ def main() -> None:
     ap.add_argument("--steps", default="4000000000")
     ap.add_argument("--extra-mib", default="64")
     ap.add_argument("--ref", default="quant", choices=("quant", "f32"))
+    ap.add_argument("--pqw", default="build/qwen35-0.8b-int8.pqw")
+    ap.add_argument("--bridge", default=str(BRIDGE))
     ap.add_argument("--stages", action="store_true",
                     help="逐层比对残差流（需要 -DQ35_DUMP 构建的 guest）")
     ap.add_argument("--positions", type=int, default=0,
                     help="用 N 个 token 的 prompt，按位置（行）比对 3 个层的残差流；"
                          "需要 -DQ35_DUMP 构建，N<=32 时为单 chunk")
     a = ap.parse_args()
+    bridge = Path(a.bridge) if Path(a.bridge).is_absolute() else ROOT / a.bridge
 
     guest = Path(a.guest) if Path(a.guest).is_absolute() else ROOT / a.guest
     blob = Path(a.blob) if Path(a.blob).is_absolute() else ROOT / a.blob
@@ -95,7 +100,7 @@ def main() -> None:
         patched.write_bytes(data)
         blob = patched
         print(f"  prompt 换成 {len(pos_ids)} 个确定性 id（首位 {pos_ids[0]}）")
-    run_guest(guest, blob, out, a.steps, a.extra_mib)
+    run_guest(bridge, guest, blob, out, a.steps, a.extra_mib)
     b = out.read_bytes()
 
     # blob 里的 token id 就是这次跑的输入
@@ -104,7 +109,15 @@ def main() -> None:
     ids = ids[:n]
     print(f"  输入 {n} 个 token: {ids[:8]}{'...' if n > 8 else ''}")
 
-    m = R.load(MODEL_DIR, quant=(a.ref == "quant"))
+    if a.ref == "quant":
+        pqw = Path(a.pqw) if Path(a.pqw).is_absolute() else ROOT / a.pqw
+        if pqw.is_file():
+            print(f"  参考：PQW {pqw.name}（与设备同一份已量化权重）")
+            m = R.load_pqw(pqw)
+        else:
+            m = R.load(MODEL_DIR, quant=True)
+    else:
+        m = R.load(MODEL_DIR, quant=False)
     m.reset()
     st = {}
     lg = m.forward(ids, st)

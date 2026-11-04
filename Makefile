@@ -5,12 +5,12 @@
 #
 # 可用变量覆盖：CLANG / CROSS / LINK_LD / NPUCC / TILE_NPU_SIM / PY
 
-CLANG     ?= ../build/bin/clang++
+CLANG     ?= ../llvm-project/build/bin/clang++
 CROSS     ?= riscv64-unknown-elf-
-LINK_LD   ?= $(HOME)/Tile-NPU-Sim/tests/guest/link.ld
-NPUCC     ?= ../../npucc
+LINK_LD   ?= link.ld
+TILE_NPU_SIM ?= ../Tile-NPU-Sim
 # 系统 python3 没有 numpy；用 DSH 的 bundled python（可用 make PY=... 覆盖）
-PY        ?= $(HOME)/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/bin/python3
+PY        ?= python3
 
 # x31 = blob 基址、x30 = 栈顶：由 sim_bridge/crt0 约定传入，编译器不得挪用，
 # 否则 main 里 asm("mv %0, x31") 可能读到被清零的 x31（0.6B 实测踩过）。
@@ -19,14 +19,15 @@ TARGET    := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
              -std=c++20 -O1 -nostdinc++ -isystem test_include
 INC       := -I include -I kernels -I . -I config
 BUILD     := build
+BRIDGE    := $(BUILD)/sim_bridge
 KERNELS   := $(wildcard kernels/*.h)
-SRC       := ../../qwen3.5-0.8b-bf16
+SRC       ?= ../qwen3.5-0.8b-bf16
 PQW       := $(BUILD)/qwen35-0.8b-int8.pqw
 HDR       := config/model_qwen35.h
 BLOB      := $(BUILD)/qwen35_data.bin
 GUEST     := $(BUILD)/qwen35.bin
 
-.PHONY: all pqw header blob guest check clean stats
+.PHONY: all pqw header blob guest check clean stats bridge dump chat
 
 all: $(GUEST)
 
@@ -47,16 +48,18 @@ header blob: $(HDR) $(BLOB)
 
 $(BUILD)/main.o: src/main.cpp $(KERNELS) $(HDR) | $(BUILD)
 	$(CLANG) $(TARGET) $(INC) -c $< -o $@
+	# 旧 binutils 不认 clang 21 的 zmmul/xaicore 属性（链接脚本会丢弃它们）
+	$(CROSS)objcopy --remove-section=.riscv.attributes $@ $@.link
 
 $(BUILD)/crt0.o: src/crt0.S | $(BUILD)
 	$(CROSS)as -mabi=lp64 $< -o $@
 
 $(BUILD)/qwen35.elf: $(BUILD)/main.o $(BUILD)/crt0.o
-	$(CROSS)ld -T $(LINK_LD) $^ -o $@
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/main.o.link $(BUILD)/crt0.o -o $@
 
 $(GUEST): $(BUILD)/qwen35.elf
 	$(CROSS)objcopy -O binary $< $@
-	@echo "guest: $@ ($$(stat -f%z $@) 字节)"
+	@echo "guest: $@ ($$(stat -c%s $@) 字节)"
 
 guest: $(GUEST)
 
@@ -65,7 +68,8 @@ guest: $(GUEST)
 # 会把转储区覆盖掉）。
 $(BUILD)/qwen35d.bin: src/main.cpp $(KERNELS) $(HDR) | $(BUILD)
 	$(CLANG) $(TARGET) $(INC) -DQ35_DUMP -c src/main.cpp -o $(BUILD)/maind.o
-	$(CROSS)ld -T $(LINK_LD) $(BUILD)/maind.o $(BUILD)/crt0.o -o $(BUILD)/qwen35d.elf
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/maind.o $(BUILD)/maind.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/maind.o.link $(BUILD)/crt0.o -o $(BUILD)/qwen35d.elf
 	$(CROSS)objcopy -O binary $(BUILD)/qwen35d.elf $@
 	@echo "dump guest: $@"
 
@@ -79,8 +83,19 @@ $(BUILD)/main.s: src/main.cpp $(KERNELS) $(HDR) | $(BUILD)
 stats: $(BUILD)/main.s
 	@echo "静态指令数: $$(grep -cE '^[[:space:]]+[a-z]' $(BUILD)/main.s)"
 
-check: $(GUEST) $(BLOB)
-	$(PY) tools/check_qwen35.py --guest $(GUEST) --blob $(BLOB)
+$(BRIDGE): tools/sim_bridge.cpp $(TILE_NPU_SIM)/build/linux/x86_64/release/libsim_core.a
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O2 -I $(TILE_NPU_SIM)/include -I $(TILE_NPU_SIM)/src \
+	    tools/sim_bridge.cpp $(TILE_NPU_SIM)/build/linux/x86_64/release/libsim_core.a -o $@
+	@echo "bridge: $@"
+
+bridge: $(BRIDGE)
+
+check: $(GUEST) $(BLOB) $(BRIDGE)
+	$(PY) tools/check_qwen35.py --guest $(GUEST) --blob $(BLOB) --bridge $(BRIDGE)
+
+chat: $(GUEST) $(BLOB) $(BRIDGE)
+	$(PY) tools/chat_qwen35.py "$(TEXT)" --max-new $(or $(MAX_NEW),16)
 
 clean:
 	rm -rf $(BUILD)

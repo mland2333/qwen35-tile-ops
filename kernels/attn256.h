@@ -38,10 +38,8 @@ namespace qwen35_ops {
 // 用第三个 acc 从内存再读一次 gate（一个 aload 比想办法拷贝便宜）。
 // ---------------------------------------------------------------------------
 YAI_OP_INLINE void mul_sigmoid_rows(const MatrixView &dst, const MatrixView &gate) {
-  Acc g{};      // gate 值（最终变成 1/(1+e^-x)）
-  Acc e{};      // 分母
+  Acc e{};      // 1 + e^-gate，随后原地取倒数
   Acc d{};      // dst
-  config_acc(g, gate);
   config_acc(e, gate);
   config_acc(d, dst);
   for (std::uint32_t m = 0; m < dst.rows; m += kBlock) {
@@ -57,13 +55,11 @@ YAI_OP_INLINE void mul_sigmoid_rows(const MatrixView &dst, const MatrixView &gat
       e.mul(-1.0f);
       e.exp();
       e.add(1.0f);                    // e = 1 + e^-gate
-      set_zone(g, nr, nc);
-      g.fill(1.0f);
-      g.div(e);                       // g = 1/(1+e^-gate) = sigmoid(gate)
-      // 注意：不能写成 gate/(1+e^-gate) —— 那是 silu 不是 sigmoid（会带符号错误）
+      e.rcp();                        // e = 1/(1+e^-gate) = sigmoid(gate)
+      // ISA 没有除法：用 rcp.approx。不能写成 gate/(1+e^-gate) —— 那是 silu
       set_zone(d, nr, nc);
       load_acc_at(d, dst.data + od);
-      d.mul(g);
+      d.mul(e);
       store_acc_at(d, dst.data + od);
     }
   }
@@ -73,13 +69,15 @@ YAI_OP_INLINE void mul_sigmoid_rows(const MatrixView &dst, const MatrixView &gat
 // 一个 32 宽输出块：res += (P·V_d) * pmax
 // （与 0.6B 的实现相同：V 的量化 scale 已经折进 P，这里只乘 P 的行 scale）
 // ---------------------------------------------------------------------------
+// vT 是 V 的转置视图（[head_dim][kv_len]，row_bytes=1、col_bytes=原行跨步）：
+// ISA 只保留 mma.nt（B 按 [n][k] 存放），所以 PV 的 B 必须是 Vᵀ。
 YAI_ALWAYS_INLINE void pv_block256(Acc &res, Tile &pt, Tile &vt, Acc &part,
-                                   const MatrixView &v8, std::uint32_t j,
+                                   const MatrixView &vT, std::uint32_t j,
                                    std::uint32_t d, const Vec32 &pmax) {
-  load_tile_at(vt, v8.data + j * static_cast<std::uint32_t>(v8.row_bytes) +
-                       d * static_cast<std::uint32_t>(v8.col_bytes));
+  load_tile_at(vt, vT.data + d * static_cast<std::uint32_t>(vT.row_bytes) +
+                       j * static_cast<std::uint32_t>(vT.col_bytes));
   part.set_dtype(AccDType::I32);      // 上一轮 to_fp32 会把它改成 f32
-  pt.matmul(vt, part, /*zero=*/true, /*lt=*/false, /*rt=*/false);
+  pt.matmul(vt, part, /*zero=*/true, /*lt=*/false, /*rt=*/true);
   part.to_fp32();
   part.mul(pmax, true);               // 反量化
   res.add(part);
@@ -129,8 +127,11 @@ YAI_OP_INLINE void attention_head_hd256_blocks(
   set_zone(qt, nr, ZB);
   Tile kt{};
   config_tile(kt, k8);
+  // V 的转置视图：V[kv][hd] 当成 [hd][kv] 载入，块内就是 Vᵀ（mma.nt 的 B）
+  const MatrixView vT{v8.data, 1, v8.row_bytes,
+                      static_cast<std::uint32_t>(kHeadDim), kv_len, v8.dtype};
   Tile vt{};
-  config_tile(vt, v8);
+  config_tile(vt, vT);
   Vec32 ksv{};
   config_vec(ksv, k_scale);
   Vec32 vsv{};
@@ -206,33 +207,34 @@ YAI_OP_INLINE void attention_head_hd256_blocks(
     s.quant_ext(pmax, pt);
 
     // 1f) 8 个输出块累加
-    set_zone(vt, nc, ZB);
-    pv_block256(r0, pt, vt, part, v8, j, 0 * kBlock, pmax);
-    pv_block256(r1, pt, vt, part, v8, j, 1 * kBlock, pmax);
-    pv_block256(r2, pt, vt, part, v8, j, 2 * kBlock, pmax);
-    pv_block256(r3, pt, vt, part, v8, j, 3 * kBlock, pmax);
-    pv_block256(r4, pt, vt, part, v8, j, 4 * kBlock, pmax);
-    pv_block256(r5, pt, vt, part, v8, j, 5 * kBlock, pmax);
-    pv_block256(r6, pt, vt, part, v8, j, 6 * kBlock, pmax);
-    pv_block256(r7, pt, vt, part, v8, j, 7 * kBlock, pmax);
+    set_zone(vt, ZB, nc);
+    pv_block256(r0, pt, vt, part, vT, j, 0 * kBlock, pmax);
+    pv_block256(r1, pt, vt, part, vT, j, 1 * kBlock, pmax);
+    pv_block256(r2, pt, vt, part, vT, j, 2 * kBlock, pmax);
+    pv_block256(r3, pt, vt, part, vT, j, 3 * kBlock, pmax);
+    pv_block256(r4, pt, vt, part, vT, j, 4 * kBlock, pmax);
+    pv_block256(r5, pt, vt, part, vT, j, 5 * kBlock, pmax);
+    pv_block256(r6, pt, vt, part, vT, j, 6 * kBlock, pmax);
+    pv_block256(r7, pt, vt, part, vT, j, 7 * kBlock, pmax);
   }
 
-  // ---- 2) 最后才除分母 ----
-  r0.div(den, true);
+  // ---- 2) 最后才乘 1/den（ISA 没有除法，用 rcp.approx）----
+  den.rcp();
+  r0.mul(den, true);
   store_acc(r0, out, 0, 0 * kBlock);
-  r1.div(den, true);
+  r1.mul(den, true);
   store_acc(r1, out, 0, 1 * kBlock);
-  r2.div(den, true);
+  r2.mul(den, true);
   store_acc(r2, out, 0, 2 * kBlock);
-  r3.div(den, true);
+  r3.mul(den, true);
   store_acc(r3, out, 0, 3 * kBlock);
-  r4.div(den, true);
+  r4.mul(den, true);
   store_acc(r4, out, 0, 4 * kBlock);
-  r5.div(den, true);
+  r5.mul(den, true);
   store_acc(r5, out, 0, 5 * kBlock);
-  r6.div(den, true);
+  r6.mul(den, true);
   store_acc(r6, out, 0, 6 * kBlock);
-  r7.div(den, true);
+  r7.mul(den, true);
   store_acc(r7, out, 0, 7 * kBlock);
 }
 

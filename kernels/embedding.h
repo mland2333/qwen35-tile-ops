@@ -46,6 +46,8 @@ YAI_OP_INLINE void embedding_rows(const MatrixView &table,
   a.set_dtype(AccDType::I32);                  // widen 需要 i32；to_fp32 会改成 f32
   Vec32 idv{};
   config_vec(idv, ids);
+  // 新 ISA 要求 gather 的索引向量 dtype = u32（非负）
+  idv.set_dtype(Vec32DType::U32);
   Vec32 esv{};
   esv.set_dtype(Vec32DType::F32);
   esv.set_stride(scale.row_bytes);
@@ -110,6 +112,8 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
   a.set_dtype(AccDType::I32);
   Vec32 idv{};
   config_vec(idv, ids);
+  // 新 ISA 要求 gather 的索引向量 dtype = u32（非负）
+  idv.set_dtype(Vec32DType::U32);
   Vec32 esv{};
   esv.set_dtype(Vec32DType::F32);
   esv.set_stride(scale.row_bytes);

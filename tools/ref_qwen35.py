@@ -166,11 +166,23 @@ def q_act_rows(x: np.ndarray):
 
 
 def gemm_nt(a8, w8, a_scale, w_scale, quant=True):
-    """out = (a8 · w8ᵀ) * a_scale(行) * w_scale(列)，i32 精确累加。"""
+    """out = (a8 · w8ᵀ) * a_scale(行) * w_scale(列)，i32 精确累加。
+
+    i8 的乘积与和都远小于 2^53，所以用 float64 BLAS 再 rint 与整数路径逐位相同；
+    numpy 的整数 matmul 是逐元素循环，在参考里慢一个数量级以上。N 方向分块，
+    避免 lm_head（248320 行）一次转成 2 GB 的 float64。
+    """
     if quant:
-        acc = a8.astype(np.int32) @ w8.astype(np.int32).T
-        out = acc.astype(F32) * a_scale[:, None]
-        return (out * w_scale[None, :]).astype(F32)
+        a = a8.astype(np.float64)
+        n = w8.shape[0]
+        chunk = 8192
+        out = np.empty((a.shape[0], n), F32)
+        for n0 in range(0, n, chunk):
+            n1 = min(n, n0 + chunk)
+            acc = np.rint(a @ w8[n0:n1].astype(np.float64).T)
+            part = (acc.astype(F32) * a_scale[:, None]).astype(F32)
+            out[:, n0:n1] = (part * w_scale[None, n0:n1]).astype(F32)
+        return out
     return (a8 @ w8.T).astype(F32)
 
 
@@ -261,7 +273,10 @@ def conv_causal(x, w, hist):
     out = np.zeros((T, x.shape[1]), dtype=F32)
     for j in range(CONVK):
         out += buf[j:j + T] * w[:, j][None, :]
-    new_hist = buf[-3:].copy() if T >= 3 else np.concatenate([buf, np.zeros((3 - T, x.shape[1]), F32)])[-3:]
+    # buf = [hist(3) | x(T)]，所以最后 3 行永远是"最近的 3 个 token"。
+    # 旧写法在 T<3 时先把零补到末尾再取最后 3 行：decode（T=1）会拿到
+    # [新 token, 0, 0] 而不是 [prev2, prev1, new]，增量路径从 L0 起就发散。
+    new_hist = buf[-3:].copy()
     return out.astype(F32), new_hist
 
 
@@ -327,6 +342,108 @@ class Weights:
 
 # ---------------------------------------------------------------------------
 # 前向
+# ---------------------------------------------------------------------------
+# 从 PQWF（.pqw）直接建立参考权重：int8 行主序 + per-channel scale，f32 原样。
+# 这样参考与设备用的是**同一份已量化权重**（不再从 safetensors 重新量化），
+# 启动只需 mmap + 解析头，几百毫秒，也没有 1 GB 级的 f32 临时数组。
+# ---------------------------------------------------------------------------
+class PqwArchive:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        with open(self.path, "rb") as f:
+            magic, version, quant, flags, count, meta_len = struct.unpack("<IIIIQQ", f.read(32))
+            assert magic == 0x46575150, "not a PQWF file"
+            self.meta = json.loads(f.read(meta_len))
+            pos = 32 + meta_len
+            self.ents: dict[str, dict] = {}
+            for _ in range(count):
+                f.seek(pos)
+                (nl,) = struct.unpack("<I", f.read(4))
+                pos += 4
+                name = f.read(nl).decode()
+                pos += nl
+                (nd,) = struct.unpack("<I", f.read(4))
+                pos += 4
+                dims = list(struct.unpack(f"<{nd}Q", f.read(8 * nd)))
+                pos += 8 * nd
+                (dtype,) = struct.unpack("<I", f.read(4))
+                pos += 4
+                woff, wsize, soff, ssize = struct.unpack("<QQQQ", f.read(32))
+                pos += 32
+                scount, _pad = struct.unpack("<II", f.read(8))
+                pos += 8
+                self.ents[name] = dict(dims=dims, dtype=dtype, woff=woff, wsize=wsize,
+                                       soff=soff, ssize=ssize, scount=scount)
+            self.data_start = (pos + 31) // 32 * 32
+        self.mem = np.memmap(self.path, dtype=np.uint8, mode="r")
+
+    def _view(self, off: int, nbytes: int, dtype):
+        return self.mem[off:off + nbytes].view(dtype)
+
+    def i8(self, name: str) -> np.ndarray:
+        e = self.ents[name]
+        rows, cols = e["dims"][0], int(np.prod(e["dims"][1:]))
+        off = self.data_start + e["woff"]
+        return self._view(off, rows * cols, np.int8).reshape(rows, cols)
+
+    def f32(self, name: str, count: int) -> np.ndarray:
+        e = self.ents[name]
+        off = self.data_start + e["woff"]
+        return self._view(off, 4 * count, np.float32)
+
+    def scale(self, name: str) -> np.ndarray:
+        e = self.ents[name]
+        rows = e["dims"][0]
+        off = self.data_start + e["soff"]
+        return self._view(off, 4 * rows, np.float32)
+
+
+class PqwWeights:
+    """与 ``Weights`` 同接口：emb8/emb_s/nf/layers，但数据来自 .pqw。"""
+
+    def __init__(self, path: str | Path):
+        a = PqwArchive(path)
+        self.a = a
+        p = "model.language_model."
+        self.quant = True
+        self.emb8 = a.i8(p + "embed_tokens.weight")
+        self.emb_s = a.scale(p + "embed_tokens.weight")
+        self.nf = a.f32(p + "norm.weight", H)          # 已折叠 (1+w)
+        self.layers = []
+        for L in range(LAYERS):
+            pre = f"{p}layers.{L}."
+            def mat(sub):
+                n = pre + sub + ".weight"
+                return (a.i8(n), a.scale(n))
+            d = {
+                "n1": a.f32(pre + "input_layernorm.weight", H),      # 已折叠
+                "n2": a.f32(pre + "post_attention_layernorm.weight", H),
+                "gate": mat("mlp.gate_proj"),
+                "up": mat("mlp.up_proj"),
+                "down": mat("mlp.down_proj"),
+            }
+            if L in FULL_LAYER:
+                d["type"] = "full"
+                d["q"] = mat("self_attn.q_proj")
+                d["k"] = mat("self_attn.k_proj")
+                d["v"] = mat("self_attn.v_proj")
+                d["o"] = mat("self_attn.o_proj")
+                d["qn"] = a.f32(pre + "self_attn.q_norm.weight", HD)
+                d["kn"] = a.f32(pre + "self_attn.k_norm.weight", HD)
+            else:
+                d["type"] = "linear"
+                d["qkv"] = mat("linear_attn.in_proj_qkv")
+                d["z"] = mat("linear_attn.in_proj_z")
+                d["b"] = mat("linear_attn.in_proj_b")
+                d["a"] = mat("linear_attn.in_proj_a")
+                d["out"] = mat("linear_attn.out_proj")
+                d["conv"] = a.f32(pre + "linear_attn.conv1d.weight", CONV_DIM * CONVK).reshape(CONV_DIM, CONVK)
+                d["norm"] = a.f32(pre + "linear_attn.norm.weight", DV)
+                d["alog_exp"] = a.f32(pre + "linear_attn.A_log_exp", GDN_VH)
+                d["dtb"] = a.f32(pre + "linear_attn.dt_bias", GDN_VH)
+            self.layers.append(d)
+
+
 # ---------------------------------------------------------------------------
 class Ref:
     def __init__(self, weights: Weights, quant: bool = True, seq: int = 32):
@@ -531,3 +648,8 @@ class Ref:
 def load(model_dir: str | Path, quant: bool = True) -> Ref:
     st = SafeTensors(Path(model_dir) / "model.safetensors-00001-of-00001.safetensors")
     return Ref(Weights(st, quant).load(), quant=quant)
+
+
+def load_pqw(pqw_path: str | Path) -> Ref:
+    """从 .pqw 建立参考（int8 权重与设备逐字节相同，mmap 零拷贝）。"""
+    return Ref(PqwWeights(pqw_path), quant=True)

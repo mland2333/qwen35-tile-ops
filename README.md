@@ -4,10 +4,46 @@
 （24 层 = 18 层 Gated DeltaNet + 6 层全注意力），权重走
 `bf16 → int8(PQWF 扩展) → guest blob`，在 Tile-NPU-Sim 上跑通并与 numpy 参考对拍。
 
-**当前状态一句话**：端到端跑通（prefill 32 = 9,841,029 条动态指令），
-**L0–L3 与参考逐位一致（rel ≈ 2e-7，f32 舍入量级）**，L4 起因 int8 量化决策在
-舍入边界上翻转而发散到 ~1e-2，最终 logits 与参考 **argmax 一致、top-10 完全重合、
-corr 0.9957**（详见 §6 的实测数据与"为什么不逐位"）。
+**当前状态一句话**（2026-11 在本机 Ubuntu 上重新验证）：端到端跑通
+（prefill 32 = 10,579,019 条动态指令，f32 状态读路径），
+**L0–L3 与参考逐位一致（rel ≈ 1.2e-7 ~ 2.4e-7，f32 舍入量级）**，L4 起因 int8
+量化决策在舍入边界上翻转而发散到 ~1e-2，最终 logits 与参考 **argmax 一致、
+top-10 完全重合、corr 0.996196**；**贪心生成 10 个 token 与参考逐个相同**
+（"The capital of France is" → " the capital of the country.\nThe capital of"）。
+详见 §6 的实测数据与"为什么不逐位"。
+
+> **本轮（Ubuntu 迁移后）修了什么**：ISA 删除除法 / `mma.nn` / gather 索引改
+> u32 之后，算子与参考里有 5 处没跟上；另外 GDN 状态读的默认值被写成了 i8
+> （应为 f32）。修复清单与复现命令见 §0。
+
+---
+
+## 0. 本机（Ubuntu）复现与修复记录
+
+环境：`../llvm-project/build/bin/clang++`（LLVM 21.1.7 + XAICore）、
+`riscv64-unknown-elf-` 工具链、`../Tile-NPU-Sim` 的 `libsim_core.a`、系统
+`python3`（numpy 1.x）。原 `npucc/sim_bridge` 已丢失，本仓库的
+`tools/sim_bridge.cpp` 是重建版（guest 装 `0x80000000`、blob 装 `0x81000000`、
+`x31` = blob 基址、按 `--dump FILE@OFF:SIZE` 回写）。
+
+**算子/参考的修复（都是 ISA 变更后没跟上的地方）：**
+
+| # | 位置 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | `attn256.h::pv_block256` | 用 `mma.nn`（右操作数不转置）——ISA 已删除 nn | 转置视图 + `rt=true`（`mma.nt`） |
+| 2 | `attn256.h`、`gdn.h`、`mlp.h` | 大量 `div`（sigmoid/softmax 分母/silu）——ISA 已删除法 | 改成 `rcp.approx` + `mul`（模拟器里 rcp 就是精确 1/x） |
+| 3 | `embedding.h` | gather 索引向量 dtype 用 i32 | 新 ISA 要求 **u32**（`idv.set_dtype(U32)`） |
+| 4 | `include/tile.h` | `Tile::dequant` 用旧的回值签名（builtin 已改成 out 参数） | `void dequant(scale, Acc&)` |
+| 5 | **`gdn.h`** | `kGdnI8Read = true`（i8 状态读）——与参考的 f32 读不一致，逐层误差 5e-2 | 改成 `false`（README §7.1 的结论），逐层误差回到 1e-7 |
+
+**参考实现的修复**：`conv_causal` 在 `T<3` 时历史更新写错（把零补到末尾再取最后
+3 行，decode 的 T=1 拿到 `[新token,0,0]`），导致"增量 decode"与"整段重算"从 L0
+起就发散；改成 `buf[-3:]` 后两者一致（1e-7 级）。另外参考改为**直接读 .pqw**
+（与设备同一份 int8 权重，mmap 零拷贝），启动从分钟级降到秒级；GEMM 用
+float64 BLAS + `rint`（i8 乘积和 < 2^53，与整数路径逐位相同）。
+
+**工具**：`tools/chat_qwen35.py`（文本进/文本出）、`--stages` 的逐层残差转储
+（slot `900000 + L*6000`）、`make bridge/chat`。
 
 ---
 
@@ -44,13 +80,19 @@ qwen35_ops/
 ## 2. 快速开始
 
 ```bash
-cd tile_api_llvm_ds/qwen35_ops
-make pqw                 # ~3 s   → build/qwen35-0.8b-int8.pqw (756 MB)
-make header blob         # ~2 s   → build/qwen35_data.bin (788 MB) + config/model_qwen35.h
-make guest               # 编译 guest（静态 51,307 条指令，205,248 B）
-make check               # 模拟器跑 + 与 numpy 参考对拍
+make pqw                 # safetensors(1.7 GB) → build/qwen35-0.8b-int8.pqw (756 MB)
+make header blob         # → build/qwen35_data.bin (788 MB) + config/model_qwen35.h
+make guest               # 编译 guest（静态 59,395 条指令，237,600 B）
+make bridge              # 重建模拟器桥（本机没有 npucc/）
+make check               # 模拟器跑 + 与 numpy 参考对拍（PQW 参考，秒级）
 make stats               # 只打印静态指令数
+make dump                # -DQ35_DUMP 版 guest（逐层残差转储）
+python3 tools/check_qwen35.py --stages --guest build/qwen35d.bin
+python3 tools/chat_qwen35.py "你好，请用一句话介绍你自己。" --max-new 16
 ```
+
+依赖变量：`CLANG=../llvm-project/build/bin/clang++`、`LINK_LD=link.ld`、
+`SRC=../qwen3.5-0.8b-bf16`、`PY=python3`、`TILE_NPU_SIM=../Tile-NPU-Sim`。
 
 模拟器桥（`npucc/`）是**本轮重建**的：原目录整份丢失，`build_sim.py` 与
 `sim_bridge` 都不在了。重建版直接用系统 clang++ 编译 Tile-NPU-Sim 的库源码
@@ -134,11 +176,11 @@ hd=256 时输出方向有 **8 个 32 宽块**，所以 r0..r7 八个常驻 acc�
 
 | 项 | Qwen3.5-0.8B | 对照：Qwen3-0.6B |
 |---|---|---|
-| 静态指令数（`main.cpp` 汇编里 tab 开头的助记符行） | **51,307** | 40,178 |
-| guest 二进制 | **205,248 B** | 160,732 B |
+| 静态指令数（`main.cpp` 汇编里 tab 开头的助记符行） | **59,395** | 40,178 |
+| guest 二进制 | **237,600 B** | 160,732 B |
 | 权重 blob | 787,797,248 B（其中权重区 777 MB） | 791 MB |
-| prefill 32 token 动态指令数 | **9,841,029** | 2,319,041 |
-| prefill 5 token 动态指令数 | 4,097,165 | — |
+| prefill 32 token 动态指令数 | **10,579,019**（f32 状态读） | 2,369,787 |
+| prefill 5 token 动态指令数 | 4,273,180 | — |
 | 层数 / 参数量 | 24 层（18 GDN + 6 full），752.8 M | 28 层，596 M |
 
 prefill-32 是 0.6B 的 **4.24×**，来源大致是三块：
@@ -149,11 +191,11 @@ GDN 递推本身约 **2.4M** 条（= 编码器细节见下），约占 1/4。
 
 | 层 | 相对误差 | 说明 |
 |---|---|---|
-| L0 / L1 / L2（GDN） | 2e-7 / 2.5e-7 / 2e-7 | f32 舍入量级 |
-| L3（首个全注意力） | 3e-7 | 同上 |
-| L4 | 9.3e-3 | 开始发散 |
-| L7 / L11 / L19（全注意力） | 1.1e-2 / 2.0e-2 / 4.3e-2 | |
-| L23 | 5.2e-2 | |
+| L0 / L1 / L2（GDN） | 1.21e-7 / 1.65e-7 / 2.05e-7 | f32 舍入量级 |
+| L3（首个全注意力） | 2.41e-7 | 同上 |
+| L4 | 9.30e-3 | 开始发散（int8 舍入决策翻转） |
+| L7 / L11 / L19（全注意力） | 1.13e-2 / 2.00e-2 / 5.81e-2 | |
+| L23 | 7.33e-2 | |
 
 **L4 的跳变不是实现 bug**，是这套 W8A8 数值本身的灵敏度：
 
@@ -172,10 +214,13 @@ i32 累加部分已经是逐位一致的，见下）。
 ### 6.3 端到端 logits（5 token prompt，`check_qwen35.py`）
 
 ```
-max|Δ| 13.05   mean|Δ| 0.1948   |Δ| 中位数 0.1636   corr 0.995672
+max|Δ| 1.169   mean|Δ| 0.1771   |Δ| 中位数 0.1480   corr 0.996196
 argmax dev 279 / ref 279        top-10 重合 10/10
-|Δ| > 1.0 的 token: 24 / 248320
+|Δ| > 1.0 的 token: 7 / 248320
 ```
+
+贪心生成（prompt = `760, 6511, 314, 9338, 369`，即 "The capital of France is"）：
+设备与参考 **10 个 token 逐个相同** → `The capital of the country.\nThe capital of`。
 
 top-5 对照（`279` = `" the"`）：
 
@@ -228,9 +273,13 @@ ref: ' the' 14.80  ' Paris'   14.25  ' located' 13.98  '\n' 13.73 ':' 13.60
 | 逐层误差 (L23) | 1.1e-1 | **~5e-2** |
 | 端到端 logits | corr 0.9935 / argmax 一致 | **corr 0.9959 / argmax 一致 / top-10 9/10** |
 
-结论：**功能模拟器上 f32 版全面更好**（指令更少、误差小 5 个数量级），因为模拟器只数
+结论：**功能模拟器上 f32 版全面更好**（误差小 5 个数量级），因为模拟器只数
 指令、不算带宽；而 i8 版的价值全在**带宽**上（36 MiB/chunk vs 2.2 GiB）。所以默认 f32，
 i8 版保留一行开关，等有带宽模型或真机时切换。
+
+> 迁移后的代码里这个开关曾被写成 `kGdnI8Read = true`（与参考的 f32 读不一致），
+> 表现为 L0 就有 5e-2 的逐层误差、端到端 corr 0.9934。改回 `false` 后 L0–L3
+> 回到 1e-7、corr 0.9962、top-10 10/10（§0 表 #5）。
 
 **这段排查的最大收获是：三个"以为是后端 bug"的现象，最后全是我们自己的字节偏移错。**
 逐段验证（`sim_gdn_pred_guest.cpp`，384 条指令）证明指令语义都是对的：
@@ -371,10 +420,10 @@ W8A8 参考"的保真度。
 | M2 全注意力层（hd256/GQA/输出门/部分 RoPE） | ✅ 1e-7 级 |
 | M3 单层 GDN（短卷积/L2norm/递推/门控） | ✅ 2e-7 级 |
 | M4 24 层 + 权重转换全链路 | ✅ 端到端跑通，argmax/top-10 一致 |
-| M5 decode 循环 + 采样 + tokenizer | ⚠️ 部分：guest 支持 `mode=1` 单步 + 内置贪心 argmax（`argmax_logits`），**没做** tokenizer 串联、温度/top-p 采样、逐 token 往返脚本 |
+| M5 decode 循环 + 采样 + tokenizer | ⚠️ 部分：**贪心 decode + tokenizer 串联已做**（`tools/chat_qwen35.py`，10 token 与参考逐个相同）；**没做**温度/top-p 采样 |
 | M6 视觉塔 + MTP | ❌ 未做（权重已下载，`model.visual.*` 与 `mtp.*` 在 safetensors 里） |
 | 性能优化 | ❌ 未做：GDN 常驻化（§7.1）、chunked delta rule、权重预分块 |
-| 长序列 / decode 验证 | ❌ 只验证了 5 token（1 个 chunk）与 32 token prefill；跨 chunk 的卷积历史与 KV cache 增长只做了代码级检查，**没有数值对拍** |
+| 长序列 / decode 验证 | ✅ decode 10 步与参考逐个相同；32 token prefill 数值对拍（argmax/top-10）。跨 chunk（>32 token prompt，max_seq=64）的卷积历史/KV 增长仍未数值对拍 |
 
 ## 9. 回归（0.6B 基线，改共享文件后必对）
 

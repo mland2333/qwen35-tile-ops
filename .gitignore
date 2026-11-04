@@ -1,0 +1,7 @@
+build/
+weights/
+*.bin
+*.elf
+*.o
+__pycache__/
+*.pyc

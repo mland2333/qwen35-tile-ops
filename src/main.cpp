@@ -14,6 +14,7 @@
 #include "../kernels/attn256.h"
 #include "../kernels/embedding.h"
 #include "../kernels/flat.h"
+#include "../kernels/spec.h"
 #include "../kernels/qwen35.h"
 #include "model_qwen35.h"
 
@@ -64,6 +65,8 @@ struct ModelViews {
   MatrixView qg, qf, kr, vr, attn, at8, as, out;
   MatrixView lg, lu, lsw, ls8, lss;
   MatrixView logits, argf, argi;
+  std::byte *scratch;            // blob 之后的空闲 RAM：检查点 | 全行 logits
+  MatrixView logits_all;
 };
 
 // ---------------------------------------------------------------------------
@@ -362,8 +365,9 @@ YAI_ALWAYS_INLINE void full_layer(const ModelViews &w, std::byte *lw, std::byte 
 // ---------------------------------------------------------------------------
 // 一块 token（rows <= kSeq）的完整前向。pos 是本块第一个 token 的绝对位置。
 // ---------------------------------------------------------------------------
+// logits_mode: 0 = 不算 logits，1 = 只算最后一行，2 = 每行都算（投机验证用）
 YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
-                                     std::uint32_t rows, bool want_logits) {
+                                     std::uint32_t rows, int logits_mode) {
   constexpr int H = mb::kHidden;
   constexpr float kInvH = 1.0f / static_cast<float>(mb::kHidden);
 
@@ -478,7 +482,13 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
 #endif
   }
 
-  if (want_logits) {
+  if (logits_mode == 2) {
+    // 投机验证：整块 rows 行的 final-norm + lm_head 一次算完（权重只流一遍）
+    rmsnorm_rows(x, w.nf, h2, kInvH);
+    quant_rows(h2, h8, hs);
+    // lm_head 是行主序（不是 tile-major），必须走 gemm_nt
+    gemm_nt(h8, w.lm, w.lm_s, hs, sub_view(w.logits_all, 0, 0, rows, mb::kVocab));
+  } else if (logits_mode == 1) {
     // 只算最后一行的 final-norm + lm_head（省掉整块的 2048×1024 + 254 MB 权重读）
     const std::uint32_t last = rows - 1;
     const MatrixView xl = sub_view(w.x, last, 0, 1, H);
@@ -552,13 +562,18 @@ int main() {
   w.logits = MatrixView{blob + mb::kLOGITS, mb::kVocab * 4, 4, 1, mb::kVocab, kDtF32};
   w.argf = MatrixView{blob + mb::kARGF, 4, 4, 1, 1, kDtF32};
   w.argi = MatrixView{blob + mb::kARGI, 4, 4, 1, 1, kDtI32};
+  // blob 之后是空闲 RAM（bridge 给 1 GiB，blob 只占 788 MB）：检查点 + 全行 logits
+  w.scratch = const_cast<std::byte *>(blob) + mb::kSCRATCH_END;
+  w.logits_all = MatrixView{logits_all_ptr(w.scratch),
+                            static_cast<std::int32_t>(mb::kVocab * 4), 4, N,
+                            mb::kVocab, kDtF32};
 
   auto *ctrl = reinterpret_cast<volatile std::int32_t *>(blob + mb::kCTRL);
   const std::uint32_t n_prompt = static_cast<std::uint32_t>(ctrl[0]);
   const std::uint32_t n_gen = static_cast<std::uint32_t>(ctrl[1]);
   const std::uint32_t mode = static_cast<std::uint32_t>(ctrl[3]);
   if (mode == 1) {                       // 单步：宿主侧采样用
-    forward_chunk(w, n_prompt, 1, /*want_logits=*/true);
+    forward_chunk(w, n_prompt, 1, /*logits_mode=*/1);
     return 0;
   }
 #ifdef Q35_DUMP
@@ -569,16 +584,70 @@ int main() {
 #endif
   const std::uint32_t total = n_prompt + n_gen;
   std::uint32_t pos = 0;
-  while (pos < total) {
-    const std::uint32_t rows =
-        (pos < n_prompt) ? ((n_prompt - pos < N) ? (n_prompt - pos) : N) : 1;
-    const bool want_logits = (pos + rows >= n_prompt) && !kDumpMode;
-    forward_chunk(w, pos, rows, want_logits);
+  // ---- prefill ----
+  while (pos < n_prompt) {
+    const std::uint32_t rows = (n_prompt - pos < N) ? (n_prompt - pos) : N;
+    const int logits_mode = ((pos + rows >= n_prompt) && !kDumpMode) ? 1 : 0;
+    forward_chunk(w, pos, rows, logits_mode);
     pos += rows;
     if (pos >= n_prompt && pos < total) {
       const std::uint32_t id = argmax_logits(w);
       *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + pos * 4) = id;
     }
+  }
+  // ---- decode（mode == 2 时开投机：草稿 = 上下文最长后缀匹配）----
+  const auto *idp = reinterpret_cast<const std::uint32_t *>(w.ids.data);
+  constexpr std::uint32_t kDraftMax = 7;
+  std::uint32_t n_verify = 0, n_draft = 0, n_accept = 0;
+  while (pos + 1 < total && !kDumpMode) {
+    const std::uint32_t budget = total - pos - 1;
+    std::uint32_t draft[kDraftMax];
+    std::uint32_t n = 0;
+    if (mode == 2) {
+      const std::uint32_t k = budget < kDraftMax ? budget : kDraftMax;
+      n = lookup_draft(idp, pos, k, draft);
+    }
+    if (n == 0) {
+      // 普通单步：处理 ids[pos]（它是已知的），预测 ids[pos + 1]
+      forward_chunk(w, pos, 1, 1);
+      const std::uint32_t id = argmax_logits(w);
+      ++pos;
+      *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + pos * 4) = id;
+      continue;
+    }
+    // 验证：从 pos-1（最后一个已知 token）起喂 1+n 行，第 r 行的 argmax
+    // 预测的就是 ids[pos + r]。lm_head 的权重因此只流一遍。
+    save_state(blob, ckpt_ptr(w.scratch));
+    for (std::uint32_t i = 0; i < n; ++i) {
+      *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + (pos + 1 + i) * 4) = draft[i];
+    }
+    forward_chunk(w, pos, 1 + n, 2);   // 处理位置 pos..pos+n，行 r 预测 pos+1+r
+    ++n_verify; n_draft += n;
+    std::uint32_t m = 0;
+    while (m < n) {
+      const std::uint32_t got =
+          argmax_flat(sub_view(w.logits_all, m, 0, 1, mb::kVocab), w.argf, w.argi);
+      if (got != draft[m]) break;
+      ++m;
+    }
+    const std::uint32_t last =
+        argmax_flat(sub_view(w.logits_all, m, 0, 1, mb::kVocab), w.argf, w.argi);
+    for (std::uint32_t i = 0; i < m; ++i) {
+      *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + (pos + 1 + i) * 4) = draft[i];
+    }
+    *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + (pos + 1 + m) * 4) = last;
+    const std::uint32_t accepted = m + 1;
+    n_accept += accepted;
+    if (m != n) {
+      // 部分接受：回到验证前（状态在 pos-1），只把接受的前缀 pos..pos+m 再走一遍
+      restore_state(blob, ckpt_ptr(w.scratch));
+      forward_chunk(w, pos, accepted, 0);
+    }
+    pos += accepted;
+  }
+  if (mode == 2) {
+    auto *st = reinterpret_cast<volatile std::uint32_t *>(blob + mb::kDUMP);
+    st[0] = n_verify; st[1] = n_draft; st[2] = n_accept; st[3] = pos;
   }
   return 0;
 }

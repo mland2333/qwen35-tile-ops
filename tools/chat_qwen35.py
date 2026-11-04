@@ -39,6 +39,7 @@ def main() -> int:
     ap.add_argument("--bridge", default=str(ROOT / "build" / "sim_bridge"))
     ap.add_argument("--tokenizer", default=str(ROOT.parent / "qwen3.5-0.8b-bf16" / "tokenizer.json"))
     ap.add_argument("--no-think", action="store_true", help="关闭 thinking 前缀")
+    ap.add_argument("--spec", action="store_true", help="开启 prompt-lookup 投机解码")
     args = ap.parse_args()
 
     c = read_layout(Path(args.header))
@@ -57,7 +58,8 @@ def main() -> int:
     start, end = c["S_BASE"], c["SCRATCH_END"]
     data[start:end] = bytes(end - start)
     struct.pack_into(f"<{c['MaxSeq']}i", data, c["IDS"], *(ids + [0] * (c["MaxSeq"] - len(ids))))
-    struct.pack_into("<4i", data, c["CTRL"], len(ids), args.max_new, c["MaxSeq"], 0)
+    struct.pack_into("<4i", data, c["CTRL"], len(ids), args.max_new, c["MaxSeq"],
+                     2 if args.spec else 0)
     work.write_bytes(data)
 
     ids_out = ROOT / "build" / "chat_ids.bin"

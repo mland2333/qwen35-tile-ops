@@ -65,7 +65,8 @@ struct ModelViews {
   MatrixView qg, qf, kr, vr, attn, at8, as, out;
   MatrixView lg, lu, lsw, ls8, lss;
   MatrixView logits, argf, argi;
-  std::byte *scratch;            // blob 之后的空闲 RAM：检查点 | 全行 logits
+  std::byte *scratch;            // blob 之后的空闲 RAM：状态槽 | 历史 | 输入 | 全行 logits
+  bool save_in;                  // 非空 = 本次 forward 是验证块，逐行存递推输入
   MatrixView logits_all;
 };
 
@@ -176,6 +177,30 @@ YAI_ALWAYS_INLINE void gdn_layer(const ModelViews &w, std::byte *lw, std::byte *
                        sub_view(w.kscr, 0, 0, rows, mb::kGdnHeads));
   }
 
+  // 投机验证：逐行保存递推的输入（mix 整行、q8/k8、四个 scale/gate 行）和历史
+  if (w.save_in) {
+    std::byte *il = in_layer_ptr(w.scratch, gi);
+    for (std::uint32_t t = 0; t < rows; ++t) {
+      copy_state_4k(il + t * kInMixBytes,
+                    w.mix.data + t * static_cast<std::uint32_t>(w.mix.row_bytes), kInMixBytes);
+      copy_bytes_i8(il + kInOffQ8 + t * kInQ8Bytes,
+                    w.q8.data + t * static_cast<std::uint32_t>(w.q8.row_bytes), kInQ8Bytes);
+      copy_bytes_i8(il + kInOffK8 + t * kInK8Bytes,
+                    w.k8.data + t * static_cast<std::uint32_t>(w.k8.row_bytes), kInK8Bytes);
+      copy_vec16(il + kInOffQScr + t * kInScrBytes,
+                 w.qscr.data + t * static_cast<std::uint32_t>(w.qscr.row_bytes));
+      copy_vec16(il + kInOffKScr + t * kInScrBytes,
+                 w.kscr.data + t * static_cast<std::uint32_t>(w.kscr.row_bytes));
+      copy_vec16(il + kInOffBeta + t * kInScrBytes,
+                 w.betas.data + t * static_cast<std::uint32_t>(w.betas.row_bytes));
+      copy_vec16(il + kInOffAlpha + t * kInScrBytes,
+                 w.alphas.data + t * static_cast<std::uint32_t>(w.alphas.row_bytes));
+      const MatrixView src3 = sub_view(buf, t + 1, 0, 3, CD);
+      MatrixView dsth{hist_row_ptr(w.scratch, gi, t), mb::kConvDim * 4, 4, 3,
+                      static_cast<std::uint32_t>(CD), kDtF32};
+      copy_rows_f32(dsth, 0, src3, 0, 3);
+    }
+  }
 #ifdef Q35_DUMP
   if (layer == 0) {
     std::byte *dg = w.blob + mb::kDUMP;
@@ -360,6 +385,36 @@ YAI_ALWAYS_INLINE void full_layer(const ModelViews &w, std::byte *lw, std::byte 
   quant_rows(attn, sub_view(w.at8, 0, 0, rows, QW), sub_view(w.as, 0, 0, rows, 1));
   gemm_nt_tiled(sub_view(w.at8, 0, 0, rows, QW), wo, wo_s,
           sub_view(w.as, 0, 0, rows, 1), sub_view(w.out, 0, 0, rows, H));
+}
+
+// ---------------------------------------------------------------------------
+// 投机部分接受：恢复验证前的状态，再用保存的输入把"接受的前缀"的递推重放一遍。
+// 只重跑 GDN 的递推（不含投影/卷积/GEMM），比重走整个前缀便宜一个数量级。
+// ---------------------------------------------------------------------------
+YAI_OP_INLINE void replay_recurrence(const ModelViews &w, std::uint32_t rows) {
+  constexpr int H = mb::kHidden;
+  for (int L = 0; L < mb::kLayers; ++L) {
+    if ((L % 4) == 3) continue;                    // 全注意力层没有递推状态
+    const int gi = L - L / 4;
+    std::byte *sp = w.blob + mb::kS_BASE + gi * mb::kS_LAYER;
+    const MatrixView sview{sp, mb::kDk * 4, 4,
+                           static_cast<std::uint32_t>(mb::kGdnHeads * mb::kDv),
+                           static_cast<std::uint32_t>(mb::kDk), kDtF32};
+    std::byte *il = in_layer_ptr(w.scratch, gi);
+    const MatrixView mixv{il, kInMixBytes, 4, rows, static_cast<std::uint32_t>(mb::kConvDim),
+                          kDtF32};
+    const MatrixView q8{il + kInOffQ8, kInQ8Bytes, 1, rows,
+                        static_cast<std::uint32_t>(mb::kKvw), kDtI8};
+    const MatrixView k8{il + kInOffK8, kInK8Bytes, 1, rows,
+                        static_cast<std::uint32_t>(mb::kKvw), kDtI8};
+    const MatrixView qscr{il + kInOffQScr, kInScrBytes, 4, rows, 16, kDtF32};
+    const MatrixView kscr{il + kInOffKScr, kInScrBytes, 4, rows, 16, kDtF32};
+    const MatrixView betas{il + kInOffBeta, kInScrBytes, 4, rows, 16, kDtF32};
+    const MatrixView alphas{il + kInOffAlpha, kInScrBytes, 4, rows, 16, kDtF32};
+    gdn_recurrence_i8(q8, k8, mixv, qscr, kscr, betas, alphas, sview,
+                      sub_view(w.o32, 0, 0, rows, mb::kKvw));
+  }
+  (void)H;
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +619,7 @@ int main() {
   w.argi = MatrixView{blob + mb::kARGI, 4, 4, 1, 1, kDtI32};
   // blob 之后是空闲 RAM（bridge 给 1 GiB，blob 只占 788 MB）：检查点 + 全行 logits
   w.scratch = const_cast<std::byte *>(blob) + mb::kSCRATCH_END;
+  w.save_in = false;
   w.logits_all = MatrixView{logits_all_ptr(w.scratch),
                             static_cast<std::int32_t>(mb::kVocab * 4), 4, N,
                             mb::kVocab, kDtF32};
@@ -617,11 +673,13 @@ int main() {
     }
     // 验证：从 pos-1（最后一个已知 token）起喂 1+n 行，第 r 行的 argmax
     // 预测的就是 ids[pos + r]。lm_head 的权重因此只流一遍。
-    save_state(blob, ckpt_ptr(w.scratch));
+    save_state(blob, ckpt_ptr(w.scratch));   // 槽 0 = 验证前状态
+    w.save_in = true;                        // 逐行保存递推输入
     for (std::uint32_t i = 0; i < n; ++i) {
       *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + (pos + 1 + i) * 4) = draft[i];
     }
     forward_chunk(w, pos, 1 + n, 2);   // 处理位置 pos..pos+n，行 r 预测 pos+1+r
+    w.save_in = false;
     ++n_verify; n_draft += n;
     std::uint32_t m = 0;
     while (m < n) {
@@ -639,9 +697,19 @@ int main() {
     const std::uint32_t accepted = m + 1;
     n_accept += accepted;
     if (m != n) {
-      // 部分接受：回到验证前（状态在 pos-1），只把接受的前缀 pos..pos+m 再走一遍
+      // 部分接受：恢复验证前的状态，历史恢复到第 m 行，然后重放递推
       restore_state(blob, ckpt_ptr(w.scratch));
-      forward_chunk(w, pos, accepted, 0);
+      for (int L = 0; L < mb::kLayers; ++L) {
+        if ((L % 4) == 3) continue;
+        const int gi = L - L / 4;
+        const MatrixView src3{hist_row_ptr(w.scratch, gi, m), mb::kConvDim * 4, 4, 3,
+                              static_cast<std::uint32_t>(mb::kConvDim), kDtF32};
+        const MatrixView dsth{w.blob + mb::kHIST_BASE + gi * mb::kHIST_LAYER,
+                              mb::kConvDim * 4, 4, 3,
+                              static_cast<std::uint32_t>(mb::kConvDim), kDtF32};
+        copy_rows_f32(dsth, 0, src3, 0, 3);
+      }
+      replay_recurrence(w, accepted);
     }
     pos += accepted;
   }

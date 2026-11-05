@@ -506,8 +506,12 @@ decode 的 embedding 走 `embedding_rmsnorm_row_flat`：一个 token 的词向�
 2. **验证**：从 pos 起一次喂 `1+n` 行（`forward_chunk(..., logits_mode=2)`），lm_head 的
    254 MB 权重只流一遍；第 r 行的 argmax 预测 `ids[pos+1+r]`，与草稿逐个比较，贪心接受。
 3. **状态**：验证前把 GDN 状态 + 卷积历史（19.3 MiB，blob 里连续的一段）用 4 KB 块存到
-   blob 之后的空闲 RAM；部分接受时恢复，再把接受的前缀（`m+1` 行）走一遍推进状态。
-   KV cache 不用检查点，按位置覆盖即可。
+   blob 之后的空闲 RAM；部分接受时恢复状态、把卷积历史恢复到第 `m` 行，然后**用保存的
+   递推输入重放**接受前缀（不再重走整个前缀的 24 层前向）。
+   输入检查点很小：每 (层, 行) 存 `mix` 整行（24 KB）+ `q8/k8`（各 2 KB）+ 四个
+   scale/gate 行（各 64 B），外加卷积历史 3 行（72 KB）——18 层 × 8 行 ≈ 4 MB，
+   而状态重放一次只要 18 × (m+1) 行的递推（约 0.3M 指令），比一次前缀 chunk
+   （≥3.2M）便宜一个数量级。KV cache 不用检查点，按位置覆盖即可。
 
 实测（prompt 5 token、贪心、`max_seq=64`）：
 

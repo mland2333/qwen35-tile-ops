@@ -40,7 +40,7 @@ QW = NH * HD                    # 2048：全注意力 q/gate 的宽度（q 和 g
 KW = NKV * HD                   # 512：k/v 的宽度
 KVW = NQH * DV                  # 2048：GDN 的 q/k/v 宽度
 SEQ = 32                        # 每次前向的 token 块大小
-MAXSEQ = 4096                   # KV cache 容量 / 总长度上限
+MAXSEQ = 8192                   # KV cache 容量 / 总长度上限
 FULL_LAYER = (3, 7, 11, 15, 19, 23)
 GDN_LAYERS = LAYERS - len(FULL_LAYER)
 

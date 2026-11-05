@@ -134,11 +134,13 @@ M-RoPE：纯文本输入 position_ids 是 arange 复制成 4 行（t=h=w），
 所以"按 [11,11,10] 交错取坐标"退化成普通 1D 部分旋转。因此 cos/sin 就是
 `[max_seq][32]` 的 1D 表；kernel 侧不做区分（接视觉塔时才需要按位置三元组摊平）。
 
-**上下文长度**：`MAXSEQ = 512`（`tools/convert_pqwf35.py`，KV 容量 = 总长度上限）。
+**上下文长度**：`MAXSEQ = 4096`（`tools/convert_pqwf35.py`，KV 容量 = 总长度上限）。
 每多一个位置，blob 只增约 **6.5 KB**（6 个全注意力层各 `2 × (512 + 4)` B 的 KV，
-加上 ids/位置/cos/sin 约 272 B）；512 时 blob 共 790.7 MB，仍能放进 1 GiB RAM。
-prefill 按 32 行一块推进，长 prompt 是多块；跨块（T=64 两块、T=70 三块）与参考对拍：
-`max|Δ| 1.06 / 1.32`、`corr 0.99697 / 0.99525`、argmax 全部相同、top-10 9/10 与 10/10。
+加上 ids/位置/cos/sin 约 272 B）；4096 时 blob 共 **813.9 MB**，加 scratch 约 884 MB，
+仍在 1 GiB RAM 内。prefill 按 32 行一块推进，长 prompt 是多块；跨块（T=64 两块、T=70 三块）与参考对拍：
+`max|Δ| 1.06 / 1.32`、`corr 0.99697 / 0.99525`、argmax 全部相同、top-10 9/10 与 10/10；
+T=128（四块）`max|Δ| 1.72`、`corr 0.99441`、argmax 相同、top-10 9/10；
+T=530（17 块）+ 生成 20 也能跑通（越过旧的 512 上限），244M 指令 / 235 s。
 
 ## 5. 实现要点
 

@@ -30,7 +30,7 @@
 namespace {
 
 constexpr std::uint64_t MEMORY_BASE = 0x80000000;
-constexpr std::size_t DEFAULT_MEMORY_MIB = 1024;
+constexpr std::size_t DEFAULT_MEMORY_MIB = 2048;
 
 bool parse_u64(std::string_view text, std::uint64_t &value) {
   try {

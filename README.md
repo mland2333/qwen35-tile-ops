@@ -134,15 +134,18 @@ M-RoPE：纯文本输入 position_ids 是 arange 复制成 4 行（t=h=w），
 所以"按 [11,11,10] 交错取坐标"退化成普通 1D 部分旋转。因此 cos/sin 就是
 `[max_seq][32]` 的 1D 表；kernel 侧不做区分（接视觉塔时才需要按位置三元组摊平）。
 
-**上下文长度**：`MAXSEQ = 8192`（`tools/convert_pqwf35.py`，KV 容量 = 总长度上限）。
+**上下文长度**：`MAXSEQ = 16384`（`tools/convert_pqwf35.py`，KV 容量 = 总长度上限）。
 每多一个位置，blob 只增约 **6.5 KB**（6 个全注意力层各 `2 × (512 + 4)` B 的 KV，
-加上 ids/位置/cos/sin 约 272 B）；8192 时 blob 共 **840.4 MB**，加 scratch 约 914 MB，
-仍在 1 GiB RAM 内（bridge 默认 `--memory 1024` 不用改）。prefill 按 32 行一块推进，长 prompt 是多块；跨块（T=64 两块、T=70 三块）与参考对拍：
+加上 ids/位置/cos/sin 约 272 B）；16384 时 blob 共 **893.3 MB**，加 scratch 约 967 MB，
+因此 bridge 的默认内存从 1 GiB 提到 **2 GiB**（`DEFAULT_MEMORY_MIB = 2048`，
+地址范围 0x80000000..0xFFFFFFFF 正好 2 GiB，guest 的 32 位地址仍够用）。prefill 按 32 行一块推进，长 prompt 是多块；跨块（T=64 两块、T=70 三块）与参考对拍：
 `max|Δ| 1.06 / 1.32`、`corr 0.99697 / 0.99525`、argmax 全部相同、top-10 9/10 与 10/10；
 T=128（四块）`max|Δ| 1.72`、`corr 0.99441`、argmax 相同、top-10 9/10；
 T=256（八块）`max|Δ| 1.63`、`corr 0.99538`、argmax 相同、top-10 9/10；
 T=530（17 块）+ 生成 20 跑通（244M 指令 / 235 s）；
 T=1000（32 块）+ 生成 10 跑通（349M 指令 / 396 s）。
+`max_seq` 只改缓冲区大小，不影响数值：同一 prompt 在 8192 与 16384 下的 T=256
+最后一行 logits **逐位相同**。
 
 ## 5. 实现要点
 

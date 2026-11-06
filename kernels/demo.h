@@ -31,44 +31,100 @@ YAI_ALWAYS_INLINE Vec32 make_vec32(const MatrixView &v) {
 
 // ----------------------------------------------------------------------------
 // 算子：out[M][N] = (x[M][K] · W[N][K]ᵀ) * s[M]
-//   任意 M/N/K（不必是 32 的倍数）：按 32×32 分块，尾块用 block_zone 收窄 zone。
-//   描述符与块位置无关，所以 stride/dtype 只在最外层配一次，循环里只 set_data。
+//
+// 三个针对硬件流水线的写法：
+//   1) K 方向双缓冲：x/w 各两个 tile，循环里"预取下一块 + 算当前块"，
+//      两个操作数在不同寄存器上 → 记分牌允许 LD 与 MMA 重叠（没有 WAR）；
+//   2) 第一块用 mma(zero=1) 顺带清零，不用单独的 fill(0)（少一次跨队列依赖 +
+//      一次 4 KB 的 acc 写）；
+//   3) 尾块剥离：满 32 的块只在外层配一次 valid_zone，循环里不再写配置寄存器。
 // ----------------------------------------------------------------------------
 YAI_OP_INLINE void demo_mac(const MatrixView &x, const MatrixView &w,
                             const MatrixView &s, const MatrixView &out) {
-  Tile xt(x.data, x.row_bytes, x.col_bytes, 32, 32, TileDType::I8);    // 左：x 的块
-  Tile wt(w.data, w.row_bytes, w.col_bytes, 32, 32, TileDType::I8);    // 右：W 的块
-  Acc a(out.data, out.row_bytes, out.col_bytes, 32, 32, AccDType::I32);  // 累加器
-  Vec32 v(s.data, s.col_bytes, 32, Vec32DType::F32);                   // 每行 scale
+  Tile xt0(x.data, x.row_bytes, x.col_bytes, 32, 32, TileDType::I8);   // x 的双缓冲
+  Tile xt1(x.data, x.row_bytes, x.col_bytes, 32, 32, TileDType::I8);
+  Tile wt0(w.data, w.row_bytes, w.col_bytes, 32, 32, TileDType::I8);   // w 的双缓冲
+  Tile wt1(w.data, w.row_bytes, w.col_bytes, 32, 32, TileDType::I8);
+  Acc a(out.data, out.row_bytes, out.col_bytes, 32, 32, AccDType::I32);
+  Vec32 v(s.data, s.col_bytes, 32, Vec32DType::F32);
+
+  const std::uint32_t kfull = x.cols & ~31u;        // 满 32 的部分
+  const std::uint32_t ktail = x.cols - kfull;       // 尾块元素数
 
   for (std::uint32_t m = 0; m < out.rows; m += 32) {
-    const std::uint8_t rows = block_zone(out.rows, m);        // 尾块只有 rows 行
+    const std::uint8_t rows = block_zone(out.rows, m);
     v.set_valid_zone(rows);
     v.set_data(s.data + m * s.row_bytes);
     v.load();
     for (std::uint32_t n = 0; n < out.cols; n += 32) {
       const std::uint8_t cols = block_zone(out.cols, n);
-      a.set_dtype(AccDType::I32);                             // 每块重新 i32 累加
-      a.set_valid_zone(rows, cols);
-      a.fill(0.0f);                                           // 清零（mma 的 zero=0 常累加）
-      for (std::uint32_t k = 0; k < x.cols; k += 32) {        // K 方向累加
-        const std::uint8_t kc = block_zone(x.cols, k);
-        xt.set_valid_zone(rows, kc);
-        xt.set_data(x.data + m * x.row_bytes + k * x.col_bytes);
-        xt.load();
-        wt.set_valid_zone(cols, kc);
-        wt.set_data(w.data + n * w.row_bytes + k * w.col_bytes);
-        wt.load();
-        // zero/lt/rt 必须是编译期常量，所以这里恒为「累加」
-        xt.matmul(wt, a, /*zero=*/false, /*lt=*/false, /*rt=*/true);
+      a.set_dtype(AccDType::I32);          // 每个输出块重新 i32 累加（上一次 to_fp32 改成了 f32）
+      a.set_valid_zone(rows, cols);        // acc 的 zone 跟着输出块（尾块收窄）
+      // 满块：zone 只在每块开始配一次（K 方向全部是 32）
+      xt0.set_valid_zone(rows, 32);
+      xt1.set_valid_zone(rows, 32);
+      wt0.set_valid_zone(cols, 32);
+      wt1.set_valid_zone(cols, 32);
+
+      if (kfull >= 64) {
+        xt0.set_data(x.data + m * x.row_bytes);
+        wt0.set_data(w.data + n * w.row_bytes);
+        xt0.load();
+        wt0.load();
+        xt1.set_data(x.data + m * x.row_bytes + 32 * x.col_bytes);
+        wt1.set_data(w.data + n * w.row_bytes + 32 * w.col_bytes);
+        xt1.load();
+        wt1.load();
+        xt0.matmul(wt0, a, /*zero=*/true, false, true);   // 第 0 块（顺带清零）
+        bool pending1 = true;                            // 下一块在 buf1 里
+        for (std::uint32_t k = 64; k < kfull; k += 32) {
+          if (pending1) {
+            xt0.set_data(x.data + m * x.row_bytes + k * x.col_bytes);
+            wt0.set_data(w.data + n * w.row_bytes + k * w.col_bytes);
+            xt0.load();
+            wt0.load();
+            xt1.matmul(wt1, a, false, false, true);      // 与上面的 load 并行
+            pending1 = false;
+          } else {
+            xt1.set_data(x.data + m * x.row_bytes + k * x.col_bytes);
+            wt1.set_data(w.data + n * w.row_bytes + k * w.col_bytes);
+            xt1.load();
+            wt1.load();
+            xt0.matmul(wt0, a, false, false, true);
+            pending1 = true;
+          }
+        }
+        if (pending1) {                                  // 收尾：最后预取的那块
+          xt1.matmul(wt1, a, false, false, true);
+        } else {
+          xt0.matmul(wt0, a, false, false, true);
+        }
+      } else if (kfull == 32) {
+        xt0.set_data(x.data + m * x.row_bytes);
+        wt0.set_data(w.data + n * w.row_bytes);
+        xt0.load();
+        wt0.load();
+        xt0.matmul(wt0, a, /*zero=*/true, false, true);
       }
-      a.to_fp32();                                            // i32 → f32
-      a.mul(v, /*col=*/true);                                 // 每行 scale 广播
+
+      if (ktail != 0) {                                  // 尾块：单独一次，zone 收窄
+        if (kfull == 0) a.fill(0.0f);                    // K < 32：没有第一块，手动清零
+        xt0.set_valid_zone(rows, static_cast<std::uint8_t>(ktail));
+        wt0.set_valid_zone(cols, static_cast<std::uint8_t>(ktail));
+        xt0.set_data(x.data + m * x.row_bytes + kfull * x.col_bytes);
+        wt0.set_data(w.data + n * w.row_bytes + kfull * w.col_bytes);
+        xt0.load();
+        wt0.load();
+        xt0.matmul(wt0, a, /*zero=*/false, false, true);   // 唯一调用点（flag 必须常量）
+      }
+
+      a.to_fp32();                                        // i32 → f32
+      a.mul(v, /*col=*/true);                             // 每行 scale 广播
       a.set_data(out.data + m * out.row_bytes + n * out.col_bytes);
       a.store();
     }
   }
-  a.set_layout_row_major();                                   // 复位 layout（约定）
+  a.set_layout_row_major();
 }
 
 } // namespace qwen35_ops

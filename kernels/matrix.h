@@ -53,6 +53,23 @@ YAI_ALWAYS_INLINE MatrixView sub_view(const MatrixView &v, std::uint32_t r0,
 }
 
 // ----------------------------------------------------------------------------
+// 从 MatrixView 直接构造寄存器（全字段构造的语法糖）。
+// dtype 默认取视图的 dtype；Acc 默认 f32（做 i32 累加时显式传 AccDType::I32）。
+// ----------------------------------------------------------------------------
+YAI_ALWAYS_INLINE Tile make_tile(const MatrixView &v) {
+  return Tile(v.data, v.row_bytes, v.col_bytes, v.rows, v.cols,
+              static_cast<TileDType>(v.dtype));
+}
+
+YAI_ALWAYS_INLINE Acc make_acc(const MatrixView &v, AccDType dtype = AccDType::F32) {
+  return Acc(v.data, v.row_bytes, v.col_bytes, v.rows, v.cols, dtype);
+}
+
+YAI_ALWAYS_INLINE Vec32 make_vec32(const MatrixView &v) {
+  return Vec32(v.data, v.col_bytes, v.rows, static_cast<Vec32DType>(v.dtype));
+}
+
+// ----------------------------------------------------------------------------
 // block_zone(total, off)：从 off 开始、长度 ≤32 的块有多少个元素。
 //
 // 它是所有 load_* 的 valid_zone 来源（硬件只会搬运有效区，区外不动）：

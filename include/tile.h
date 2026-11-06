@@ -54,6 +54,11 @@ enum class Vec32DType : std::uint8_t {
 
 static constexpr int TILE = 32;
 
+// valid_zone 的硬件上限是 32；构造寄存器时把 rows/cols 截到这里。
+constexpr std::uint8_t zone_of(std::uint32_t n) {
+  return static_cast<std::uint8_t>(n > 32 ? 32 : n);
+}
+
 // Tile/Acc/Vec 在 LLVM IR 里的值载体（vector_size 以字节计）：
 //   Tile  = 32x32 i8  = 1024 bytes = <1024 x i8>
 //   Acc   = 32x32 i32 = 4096 bytes = <1024 x i32>
@@ -93,6 +98,17 @@ struct Tile {
   TileValue value_;
   YAI_ALWAYS_INLINE Tile()
       : value_(YAI_COMPILER_INTRINSIC(tile_create)()) {}
+  // 全字段构造：strides / dtype / valid_zone / base 一次配好
+  // （zone 截到 32；layout 默认 row_major）。
+  YAI_ALWAYS_INLINE Tile(std::byte *data, std::int32_t row_stride,
+                         std::int32_t col_stride, std::uint32_t rows,
+                         std::uint32_t cols, TileDType dtype = TileDType::I8)
+      : value_(YAI_COMPILER_INTRINSIC(tile_create)()) {
+    set_strides(row_stride, col_stride);
+    set_dtype(dtype);
+    set_valid_zone(zone_of(rows), zone_of(cols));
+    set_data(data);
+  }
   YAI_ALWAYS_INLINE explicit Tile(TileValue value) : value_(value) {}
 
   // ------------------------------------------------------------------------
@@ -205,6 +221,18 @@ struct Acc {
   AccValue value_;
   YAI_ALWAYS_INLINE Acc()
       : value_(YAI_COMPILER_INTRINSIC(acc_create)()) {}
+  // 全字段构造：strides / dtype / valid_zone / base 一次配好，
+  // 并把 layout 复位成 row_major（寄存器可能被上一个 kernel 留成 flat）。
+  YAI_ALWAYS_INLINE Acc(std::byte *data, std::int32_t row_stride,
+                        std::int32_t col_stride, std::uint32_t rows,
+                        std::uint32_t cols, AccDType dtype = AccDType::F32)
+      : value_(YAI_COMPILER_INTRINSIC(acc_create)()) {
+    set_strides(row_stride, col_stride);
+    set_dtype(dtype);
+    set_valid_zone(zone_of(rows), zone_of(cols));
+    set_data(data);
+    set_layout_row_major();
+  }
   YAI_ALWAYS_INLINE explicit Acc(AccValue value) : value_(value) {}
 
   // ------------------------------------------------------------------------
@@ -382,6 +410,14 @@ struct Vec8 {
   Vec8Value value_;
   YAI_ALWAYS_INLINE Vec8()
       : value_(YAI_COMPILER_INTRINSIC(vec8_create)()) {}
+  YAI_ALWAYS_INLINE Vec8(std::byte *data, std::int32_t stride, std::uint32_t len,
+                         Vec8DType dtype = Vec8DType::I8)
+      : value_(YAI_COMPILER_INTRINSIC(vec8_create)()) {
+    set_stride(stride);
+    set_dtype(dtype);
+    set_valid_zone(zone_of(len));
+    set_data(data);
+  }
   YAI_ALWAYS_INLINE explicit Vec8(Vec8Value value) : value_(value) {}
 
   YAI_ALWAYS_INLINE std::byte *get_data() const {
@@ -438,6 +474,15 @@ struct Vec32 {
   Vec32Value value_;
   YAI_ALWAYS_INLINE Vec32()
       : value_(YAI_COMPILER_INTRINSIC(vec32_create)()) {}
+  // 全字段构造：stride / dtype / valid_zone / base 一次配好（len 截到 32）。
+  YAI_ALWAYS_INLINE Vec32(std::byte *data, std::int32_t stride, std::uint32_t len,
+                          Vec32DType dtype = Vec32DType::F32)
+      : value_(YAI_COMPILER_INTRINSIC(vec32_create)()) {
+    set_stride(stride);
+    set_dtype(dtype);
+    set_valid_zone(zone_of(len));
+    set_data(data);
+  }
   YAI_ALWAYS_INLINE explicit Vec32(Vec32Value value) : value_(value) {}
 
   YAI_ALWAYS_INLINE std::byte *get_data() const {

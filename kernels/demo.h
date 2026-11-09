@@ -46,7 +46,13 @@ YAI_OP_INLINE void demo_mac(const MatrixView &x, const MatrixView &w,
   Tile wt0(w.data, w.row_bytes, w.col_bytes, 32, 32, TileDType::I8);   // w 的双缓冲
   Tile wt1(w.data, w.row_bytes, w.col_bytes, 32, 32, TileDType::I8);
   Acc a(out.data, out.row_bytes, out.col_bytes, 32, 32, AccDType::I32);
-  Vec32 v(s.data, s.col_bytes, 32, Vec32DType::F32);
+  Acc ao(out.data, out.row_bytes, out.col_bytes, 32, 32, AccDType::F32);  // f32 输出
+  Vec32 v(s.data, s.col_bytes, 32, Vec32DType::F32);                     // vRow = 每行 scale
+  Vec32 ones{};                                                          // vCol = 1
+  ones.set_dtype(Vec32DType::F32);
+  ones.set_stride(4);
+  ones.set_valid_zone(32);
+  ones.fill(1.0f);
 
   const std::uint32_t kfull = x.cols & ~31u;        // 满 32 的部分
   const std::uint32_t ktail = x.cols - kfull;       // 尾块元素数
@@ -118,13 +124,13 @@ YAI_OP_INLINE void demo_mac(const MatrixView &x, const MatrixView &w,
         xt0.matmul(wt0, a, /*zero=*/false, false, true);   // 唯一调用点（flag 必须常量）
       }
 
-      a.to_fp32();                                        // i32 → f32
-      a.mul(v, /*col=*/true);                             // 每行 scale 广播
-      a.set_data(out.data + m * out.row_bytes + n * out.col_bytes);
-      a.store();
+      ones.set_valid_zone(cols);                          // vCol.len = cols
+      ao.set_valid_zone(rows, cols);
+      adequant(ao, a, ones, v);                           // ao = f32(a) * 1 * v[i]
+      ao.set_data(out.data + m * out.row_bytes + n * out.col_bytes);
+      ao.store();
     }
   }
-  a.set_layout_row_major();
 }
 
 } // namespace qwen35_ops

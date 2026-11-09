@@ -13,7 +13,6 @@
 // ============================================================================
 #include "../kernels/attn256.h"
 #include "../kernels/embedding.h"
-#include "../kernels/flat.h"
 #include "../kernels/spec.h"
 #include "../kernels/qwen35.h"
 #include "model_qwen35.h"
@@ -439,21 +438,8 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
   const MatrixView lss = sub_view(w.lss, 0, 0, rows, 1);
 
   // ---- embedding（残差流的起点）----
-  // decode（1 token）时词向量是一行连续的 1024 i8，不需要 gather：直接
-  // tload 一行，并在同一个 Acc 上做完 rmsnorm（见 kernels/flat.h）。
   mark(w.blob, 10);
-  // 词向量是表里连续的一行：直接 tload，不用 gather；随后在同一个 Acc 里
-  // 做完第 0 层 pre-norm（顺带写残差流 x）。decode 处理单 token，prefill 的
-  // 版本把描述符常量提到循环外。
-  {
-    const MatrixView n1_0{w.blob + mb::kLGN_BASE, 4, 4, H, 1, kDtF32};
-    if (rows == 1) {
-      const std::uint32_t tok = *reinterpret_cast<const std::uint32_t *>(w.ids.data + pos * 4);
-      embedding_rmsnorm_row_flat(w.emb, w.emb_s, tok, n1_0, x, h2, kInvH);
-    } else {
-      embedding_rmsnorm_rows_flat(w.emb, w.emb_s, ids_p, n1_0, x, h2, kInvH);
-    }
-  }
+  embedding_rows(w.emb, w.emb_s, ids_p, x);
   mark(w.blob, 11);
 #ifdef Q35_DUMP
   dump_f32(w.blob + mb::kDUMP,
@@ -479,11 +465,7 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
 
     // ---- 注意力子层 ----
     mark(w.blob, 20 + L * 4);
-    if (L == 0) {
-      // 上面已经把 h2 = norm(emb) 算好了
-    } else {
-      rmsnorm_rows(x, n1, h2, kInvH);
-    }
+    rmsnorm_rows(x, n1, h2, kInvH);
     quant_rows(h2, h8, hs);
     if (full) {
       full_layer(w, lw, ln, h8, hs, x, rows, pos, L);
@@ -558,12 +540,37 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
 
 // 贪心 argmax（对 logits 第 0 行）。跨 32 列块比较时把 f32 位模式映射成单调整型
 // key：-march=rv64im 没有 F 扩展，标量浮点比较会拉 libgcc 的软浮点 helper。
+YAI_ALWAYS_INLINE std::uint32_t argmax_of(const MatrixView &logits1,
+                                          const MatrixView &argf,
+                                          const MatrixView &argi) {
+  std::uint32_t best = 0;
+  std::uint32_t best_key = 0;
+  bool first = true;
+  for (std::uint32_t n = 0; n < logits1.cols; n += kBlock) {
+    Acc a{};
+    load_acc(a, logits1, 0, n);
+    Vec32 mx = a.row_max();
+    Vec32 ix = a.row_argmax();
+    store_vec(mx, argf, 0);
+    store_vec(ix, argi, 0);
+    const std::uint32_t bits = *reinterpret_cast<const std::uint32_t *>(argf.data);
+    const std::uint32_t idx = *reinterpret_cast<const std::uint32_t *>(argi.data);
+    const std::uint32_t key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    if (first || key > best_key) {
+      best_key = key;
+      best = n + idx;
+      first = false;
+    }
+  }
+  return best;
+}
+
 YAI_ALWAYS_INLINE std::uint32_t argmax_logits(const ModelViews &w) {
-  // 平坦模式：每 1024 个 logit 装一个 Acc，一条 flat.reduce.argmax 出整个块
-  // 的最优 (idx, val)，再和累计值比较。和 row_major 版本逐位相同（规约顺序
-  // 都是"32 元素树 + 顺序合并"），但每块的指令数从 ~12 条降到 ~8 条。
-  const MatrixView logits1 = sub_view(w.logits, 0, 0, 1, mb::kVocab);
-  return argmax_flat(logits1, w.argf, w.argi);
+  return argmax_of(sub_view(w.logits, 0, 0, 1, mb::kVocab), w.argf, w.argi);
+}
+
+YAI_ALWAYS_INLINE std::uint32_t argmax_row(const ModelViews &w, std::uint32_t row) {
+  return argmax_of(sub_view(w.logits_all, row, 0, 1, mb::kVocab), w.argf, w.argi);
 }
 
 } // namespace qwen35_ops
@@ -684,12 +691,12 @@ int main() {
     std::uint32_t m = 0;
     while (m < n) {
       const std::uint32_t got =
-          argmax_flat(sub_view(w.logits_all, m, 0, 1, mb::kVocab), w.argf, w.argi);
+          argmax_row(w, m);
       if (got != draft[m]) break;
       ++m;
     }
     const std::uint32_t last =
-        argmax_flat(sub_view(w.logits_all, m, 0, 1, mb::kVocab), w.argf, w.argi);
+        argmax_row(w, m);
     for (std::uint32_t i = 0; i < m; ++i) {
       *reinterpret_cast<volatile std::uint32_t *>(w.ids.data + (pos + 1 + i) * 4) = draft[i];
     }

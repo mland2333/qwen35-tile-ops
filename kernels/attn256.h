@@ -73,14 +73,21 @@ YAI_OP_INLINE void mul_sigmoid_rows(const MatrixView &dst, const MatrixView &gat
 // ISA 只保留 mma.nt（B 按 [n][k] 存放），所以 PV 的 B 必须是 Vᵀ。
 YAI_ALWAYS_INLINE void pv_block256(Acc &res, Tile &pt, Tile &vt, Acc &part,
                                    const MatrixView &vT, std::uint32_t j,
-                                   std::uint32_t d, const Vec32 &pmax) {
+                                   std::uint32_t d, const Vec32 &pmax,
+                                   std::uint8_t nr) {
   load_tile_at(vt, vT.data + d * static_cast<std::uint32_t>(vT.row_bytes) +
                        j * static_cast<std::uint32_t>(vT.col_bytes));
-  part.set_dtype(AccDType::I32);      // 上一轮 to_fp32 会把它改成 f32
+  part.set_dtype(AccDType::I32);
   pt.matmul(vt, part, /*zero=*/true, /*lt=*/false, /*rt=*/true);
-  part.to_fp32();
-  part.mul(pmax, true);               // 反量化
-  res.add(part);
+  Vec32 ones{};
+  ones.set_dtype(Vec32DType::F32);
+  ones.set_stride(4);
+  set_len(ones, static_cast<std::uint8_t>(kBlock));
+  ones.fill(1.0f);
+  Acc pf(nullptr, 4, 4, nr, static_cast<std::uint32_t>(kBlock), AccDType::F32);
+  pf.set_dtype(AccDType::F32);
+  adequant(pf, part, ones, pmax);     // 反量化
+  res.add(pf);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,12 +171,15 @@ YAI_OP_INLINE void attention_head_hd256_blocks(
       qt.matmul(kt, s, /*zero=*/d == 0, /*lt=*/false, /*rt=*/true);
     }
 
-    // 1b) 还原量化 scale + qk_scale
-    s.to_fp32();
-    s.mul(qsv, true);
+    // 1b) 还原量化 scale + qk_scale（adequant：vCol = k scale，vRow = q scale）
     set_len(ksv, nc);
     load_vec_at(ksv, k_scale.data + j * static_cast<std::uint32_t>(k_scale.row_bytes));
-    s.mul(ksv, false);
+    {
+      Acc sf = copy_acc(s);       // i32 副本（acopy）
+      sf.set_dtype(AccDType::I32);
+      s.set_dtype(AccDType::F32); // 目的必须是 f32（to_fp32 以前顺带设置了它）
+      adequant(s, sf, ksv, qsv);
+    }
     s.mul(qk_scale);
 
     // 1c) 因果 mask（偏移 pos0 - j）
@@ -208,14 +218,14 @@ YAI_OP_INLINE void attention_head_hd256_blocks(
 
     // 1f) 8 个输出块累加
     set_zone(vt, ZB, nc);
-    pv_block256(r0, pt, vt, part, vT, j, 0 * kBlock, pmax);
-    pv_block256(r1, pt, vt, part, vT, j, 1 * kBlock, pmax);
-    pv_block256(r2, pt, vt, part, vT, j, 2 * kBlock, pmax);
-    pv_block256(r3, pt, vt, part, vT, j, 3 * kBlock, pmax);
-    pv_block256(r4, pt, vt, part, vT, j, 4 * kBlock, pmax);
-    pv_block256(r5, pt, vt, part, vT, j, 5 * kBlock, pmax);
-    pv_block256(r6, pt, vt, part, vT, j, 6 * kBlock, pmax);
-    pv_block256(r7, pt, vt, part, vT, j, 7 * kBlock, pmax);
+    pv_block256(r0, pt, vt, part, vT, j, 0 * kBlock, pmax, nr);
+    pv_block256(r1, pt, vt, part, vT, j, 1 * kBlock, pmax, nr);
+    pv_block256(r2, pt, vt, part, vT, j, 2 * kBlock, pmax, nr);
+    pv_block256(r3, pt, vt, part, vT, j, 3 * kBlock, pmax, nr);
+    pv_block256(r4, pt, vt, part, vT, j, 4 * kBlock, pmax, nr);
+    pv_block256(r5, pt, vt, part, vT, j, 5 * kBlock, pmax, nr);
+    pv_block256(r6, pt, vt, part, vT, j, 6 * kBlock, pmax, nr);
+    pv_block256(r7, pt, vt, part, vT, j, 7 * kBlock, pmax, nr);
   }
 
   // ---- 2) 最后才乘 1/den（ISA 没有除法，用 rcp.approx）----

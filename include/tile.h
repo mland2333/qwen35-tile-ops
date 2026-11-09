@@ -221,8 +221,7 @@ struct Acc {
   AccValue value_;
   YAI_ALWAYS_INLINE Acc()
       : value_(YAI_COMPILER_INTRINSIC(acc_create)()) {}
-  // 全字段构造：strides / dtype / valid_zone / base 一次配好，
-  // 并把 layout 复位成 row_major（寄存器可能被上一个 kernel 留成 flat）。
+  // 全字段构造：strides / dtype / valid_zone / base 一次配好。
   YAI_ALWAYS_INLINE Acc(std::byte *data, std::int32_t row_stride,
                         std::int32_t col_stride, std::uint32_t rows,
                         std::uint32_t cols, AccDType dtype = AccDType::F32)
@@ -231,7 +230,6 @@ struct Acc {
     set_dtype(dtype);
     set_valid_zone(zone_of(rows), zone_of(cols));
     set_data(data);
-    set_layout_row_major();
   }
   YAI_ALWAYS_INLINE explicit Acc(AccValue value) : value_(value) {}
 
@@ -395,15 +393,6 @@ struct Acc {
   YAI_ALWAYS_INLINE Vec32 row_argmax() const;
   YAI_ALWAYS_INLINE void row_argmax(Vec32 &max_val, Vec32 &idx,
                                     std::int32_t col_base) const;
-  // ---- 平坦模式（layout = flat）：整条 len = rows*32 的向量 ----
-  // 只有这一组函数能在 flat 配置下使用；其它指令一律要求 row_major。
-  YAI_ALWAYS_INLINE void set_layout_flat();
-  YAI_ALWAYS_INLINE void set_layout_row_major();
-  YAI_ALWAYS_INLINE void reduce_flat_sumsq(Vec32 &v) const;
-  YAI_ALWAYS_INLINE void reduce_flat_max(Vec32 &v) const;
-  YAI_ALWAYS_INLINE void reduce_flat_argmax(Vec32 &idx, Vec32 &val) const;
-  YAI_ALWAYS_INLINE void mul_flat_scalar(const Vec32 &v);
-  YAI_ALWAYS_INLINE void mul_flat(const Acc &other);
 };
 
 struct Vec8 {
@@ -585,6 +574,19 @@ YAI_ALWAYS_INLINE Vec32Value yai_handle(const Vec32 &value) {
   return value.value_;
 }
 
+// acc 复制（acopy）：得到一个值相同的新 Acc（配置由编译器克隆）。
+YAI_ALWAYS_INLINE Acc copy_acc(const Acc &src) {
+  return Acc(YAI_COMPILER_INTRINSIC(acc_copy)(yai_handle(src)));
+}
+
+// adequant：aD(f32) = f32(aS(i32)) * vCol * vRow
+// （源与目的必须是不同的 Acc；替换已删除的 CVT）。
+YAI_ALWAYS_INLINE void adequant(Acc &dst, const Acc &src, const Vec32 &col,
+                                const Vec32 &row) {
+  YAI_COMPILER_INTRINSIC(acc_adequant)(yai_handle(dst), yai_handle(src),
+                                       yai_handle(col), yai_handle(row));
+}
+
 // 返回新逻辑值的操作：返回值本身将来由 intrinsic 降为新的 Acc/Vec32 SSA 值。
 YAI_ALWAYS_INLINE void Tile::dequant(const Vec32 &scale, Acc &out) const {
   YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), yai_handle(out));
@@ -616,34 +618,6 @@ YAI_ALWAYS_INLINE void Acc::row_sum_sq(Vec32 &v) const {
 }
 YAI_ALWAYS_INLINE void Acc::row_absmax(Vec32 &v) const {
   YAI_COMPILER_INTRINSIC(acc_row_absmax_merge)(value_, yai_handle(v));
-}
-YAI_ALWAYS_INLINE void Acc::set_layout_flat() {
-  YAI_COMPILER_INTRINSIC(acc_set_layout)(value_, 1);
-}
-
-YAI_ALWAYS_INLINE void Acc::set_layout_row_major() {
-  YAI_COMPILER_INTRINSIC(acc_set_layout)(value_, 0);
-}
-
-YAI_ALWAYS_INLINE void Acc::reduce_flat_sumsq(Vec32 &v) const {
-  YAI_COMPILER_INTRINSIC(acc_flat_reduce_sumsq)(value_, yai_handle(v));
-}
-
-YAI_ALWAYS_INLINE void Acc::reduce_flat_max(Vec32 &v) const {
-  YAI_COMPILER_INTRINSIC(acc_flat_reduce_max)(value_, yai_handle(v));
-}
-
-YAI_ALWAYS_INLINE void Acc::reduce_flat_argmax(Vec32 &idx, Vec32 &val) const {
-  YAI_COMPILER_INTRINSIC(acc_flat_reduce_argmax)(value_, yai_handle(idx),
-                                                 yai_handle(val));
-}
-
-YAI_ALWAYS_INLINE void Acc::mul_flat_scalar(const Vec32 &v) {
-  YAI_COMPILER_INTRINSIC(acc_flat_mul_scalar)(value_, yai_handle(v));
-}
-
-YAI_ALWAYS_INLINE void Acc::mul_flat(const Acc &other) {
-  YAI_COMPILER_INTRINSIC(acc_flat_mul)(value_, yai_handle(other));
 }
 
 YAI_ALWAYS_INLINE Vec32 Acc::row_argmax() const {

@@ -442,6 +442,9 @@ YAI_OP_INLINE void gdn_recurrence_i8(const MatrixView &q8, const MatrixView &k8,
       Acc pred{};                    // mma 结果 / 行块输出（32x1）
       pred.set_strides(4, 4);
       pred.set_valid_zone(ZB, 1);
+      Acc predf(nullptr, 4, 4, ZB, 1, AccDType::F32);
+      Vec32 ones1(nullptr, 4, 1, Vec32DType::F32);
+      ones1.fill(1.0f);
       Acc upd{};                     // u ⊗ k 的临时块
       upd.set_dtype(AccDType::F32);
       set_zone(upd, ZB, ZB);
@@ -506,13 +509,14 @@ YAI_OP_INLINE void gdn_recurrence_i8(const MatrixView &q8, const MatrixView &k8,
           default: t3.matmul(bk, pred, /*zero=*/false, false, true); break;
           }
         }
-        pred.to_fp32();
-        pred.mul(sS, /*col=*/true);      // × S 的行 scale
-        pred.mul(sk);                    // × k 的 per-(token,head) scale
+        // i32 pred → f32：vCol = 1，vRow = S 的行 scale
+        predf.set_dtype(AccDType::F32);
+        adequant(predf, pred, ones1, sS);
+        predf.mul(sk);                   // × k 的 per-(token,head) scale
 
         // ---- 3) u = β (v − pred) ----
         load_acc_at(uacc, mix.data + mrow + col_v);
-        uacc.sub(pred);
+        uacc.sub(predf);
         uacc.mul(beta);
         uv = uacc.row_sum();
         set_len(uv, ZB);
@@ -566,10 +570,10 @@ YAI_OP_INLINE void gdn_recurrence_i8(const MatrixView &q8, const MatrixView &k8,
           default: t3.matmul(bq, pred, /*zero=*/false, false, true); break;
           }
         }
-        pred.to_fp32();
-        pred.mul(sO, /*col=*/true);
-        pred.mul(sq);
-        store_acc_at(pred, out32.data +
+        predf.set_dtype(AccDType::F32);
+        adequant(predf, pred, ones1, sO);
+        predf.mul(sq);
+        store_acc_at(predf, out32.data +
                                 t * static_cast<std::uint32_t>(out32.row_bytes) + col_o);
       }
 

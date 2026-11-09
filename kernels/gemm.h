@@ -52,26 +52,31 @@ YAI_ALWAYS_INLINE void gemm_one_n_block(const MatrixView &a, const MatrixView &b
                          k * static_cast<std::uint32_t>(b.col_bytes));
     ta.matmul(tb, o, /*zero=*/false, /*lt=*/false, /*rt=*/true);
   }
-  o.to_fp32();
-  o.mul(as, true);
   Vec32 ws{};
   load_vec_n(ws, b_scale, n, block_zone(b.rows, n));
-  o.mul(ws, false);
-  store_acc(o, out, m, n);
+  Acc of{};
+  of.set_strides(out.row_bytes, out.col_bytes);
+  of.set_dtype(AccDType::F32);
+  set_zone(of, rows, cols);
+  of.set_dtype(AccDType::F32);
+  adequant(of, o, ws, as);          // of = f32(o) * ws[j] * as[i]
+  store_acc_at(of, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
+                       n * static_cast<std::uint32_t>(out.col_bytes));
 }
 
 // 快路径的输出块 epilogue。
 YAI_ALWAYS_INLINE void gemm_epilogue_block(const Vec32 &as, Vec32 &ws,
                                            Acc &o, const MatrixView &b_scale,
                                            const MatrixView &out,
-                                           std::uint32_t m, std::uint32_t n) {
-  o.to_fp32();
-  o.mul(as, true);
+                                           std::uint32_t m, std::uint32_t n,
+                                           std::uint8_t rows) {
   ws.load();                            // 描述符自增（len*stride）指向下一个 n 块
-  o.mul(ws, false);
-  // acc 的 strides 已按 out 配好（与位置无关），这里只写 base_addr
-  store_acc_at(o, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
-                      n * static_cast<std::uint32_t>(out.col_bytes));
+  Acc of(out.data, out.row_bytes, out.col_bytes, rows, static_cast<std::uint32_t>(kBlock),
+         AccDType::F32);
+  of.set_dtype(AccDType::F32);
+  adequant(of, o, ws, as);
+  store_acc_at(of, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
+                       n * static_cast<std::uint32_t>(out.col_bytes));
 }
 
 YAI_OP_INLINE void gemm_nt(const MatrixView &a, const MatrixView &b,
@@ -217,14 +222,14 @@ YAI_OP_INLINE void gemm_nt(const MatrixView &a, const MatrixView &b,
           ta.matmul(t6, o6, /*zero=*/false, false, true);
           ta.matmul(t7, o7, /*zero=*/false, false, true);
         }
-        gemm_epilogue_block(as, ws, o0, b_scale, out, m, n);
-        gemm_epilogue_block(as, ws, o1, b_scale, out, m, n + 1 * kBlock);
-        gemm_epilogue_block(as, ws, o2, b_scale, out, m, n + 2 * kBlock);
-        gemm_epilogue_block(as, ws, o3, b_scale, out, m, n + 3 * kBlock);
-        gemm_epilogue_block(as, ws, o4, b_scale, out, m, n + 4 * kBlock);
-        gemm_epilogue_block(as, ws, o5, b_scale, out, m, n + 5 * kBlock);
-        gemm_epilogue_block(as, ws, o6, b_scale, out, m, n + 6 * kBlock);
-        gemm_epilogue_block(as, ws, o7, b_scale, out, m, n + 7 * kBlock);
+        gemm_epilogue_block(as, ws, o0, b_scale, out, m, n, rows);
+        gemm_epilogue_block(as, ws, o1, b_scale, out, m, n + 1 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o2, b_scale, out, m, n + 2 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o3, b_scale, out, m, n + 3 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o4, b_scale, out, m, n + 4 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o5, b_scale, out, m, n + 5 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o6, b_scale, out, m, n + 6 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o7, b_scale, out, m, n + 7 * kBlock, rows);
       }
     }
 
@@ -343,14 +348,14 @@ YAI_OP_INLINE void gemm_nt_tiled(const MatrixView &a, const MatrixView &wt,
           ta.matmul(t6, o6, false, false, true);
           ta.matmul(t7, o7, false, false, true);
         }
-        gemm_epilogue_block(as, ws, o0, b_scale, out, m, n);
-        gemm_epilogue_block(as, ws, o1, b_scale, out, m, n + 1 * kBlock);
-        gemm_epilogue_block(as, ws, o2, b_scale, out, m, n + 2 * kBlock);
-        gemm_epilogue_block(as, ws, o3, b_scale, out, m, n + 3 * kBlock);
-        gemm_epilogue_block(as, ws, o4, b_scale, out, m, n + 4 * kBlock);
-        gemm_epilogue_block(as, ws, o5, b_scale, out, m, n + 5 * kBlock);
-        gemm_epilogue_block(as, ws, o6, b_scale, out, m, n + 6 * kBlock);
-        gemm_epilogue_block(as, ws, o7, b_scale, out, m, n + 7 * kBlock);
+        gemm_epilogue_block(as, ws, o0, b_scale, out, m, n, rows);
+        gemm_epilogue_block(as, ws, o1, b_scale, out, m, n + 1 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o2, b_scale, out, m, n + 2 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o3, b_scale, out, m, n + 3 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o4, b_scale, out, m, n + 4 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o5, b_scale, out, m, n + 5 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o6, b_scale, out, m, n + 6 * kBlock, rows);
+        gemm_epilogue_block(as, ws, o7, b_scale, out, m, n + 7 * kBlock, rows);
       }
     }
     // 尾块（N 不是 32 的倍数时才会走到；我们所有预分块权重的 N 都是 32 的倍数）
@@ -384,12 +389,13 @@ YAI_OP_INLINE void gemm_nt_tiled(const MatrixView &a, const MatrixView &wt,
           tb2.load();
           ta2.matmul(tb2, o, /*zero=*/false, false, true);
         }
-        o.to_fp32();
-        o.mul(as, true);
         Vec32 w2{};
         load_vec_n(w2, b_scale, n, cols);
-        o.mul(w2, false);
-        store_acc(o, out, m, n);
+        Acc of(out.data, out.row_bytes, out.col_bytes, rows, cols, AccDType::F32);
+        of.set_dtype(AccDType::F32);
+        adequant(of, o, w2, as);
+        store_acc_at(of, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
+                             n * static_cast<std::uint32_t>(out.col_bytes));
       }
     }
   }

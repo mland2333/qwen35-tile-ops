@@ -43,7 +43,15 @@ YAI_OP_INLINE void embedding_rows(const MatrixView &table,
   config_tile(t, table);                       // table 的 row/col stride + dtype(i8)
   Acc a{};
   a.set_strides(out.row_bytes, out.col_bytes); // store 用的步长（out 是 f32 宽）
-  a.set_dtype(AccDType::I32);                  // widen 需要 i32；to_fp32 会改成 f32
+  a.set_dtype(AccDType::I32);                  // widen 需要 i32
+  Acc af{};                                    // f32 输出（adequant 的 dst）
+  af.set_strides(out.row_bytes, out.col_bytes);
+  af.set_dtype(AccDType::F32);
+  Vec32 ones{};                                // vCol = 1
+  ones.set_dtype(Vec32DType::F32);
+  ones.set_stride(4);
+  set_len(ones, kBlock);
+  ones.fill(1.0f);
   Vec32 idv{};
   config_vec(idv, ids);
   // 新 ISA 要求 gather 的索引向量 dtype = u32（非负）
@@ -68,15 +76,11 @@ YAI_OP_INLINE void embedding_rows(const MatrixView &table,
       set_zone(t, nr, nc);
       t.set_data(table.data + k * static_cast<std::uint32_t>(table.col_bytes));
       t.gather_from_vec(idv);                  // tgather
-      set_zone(a, nr, nc);
-      // widen 要求 dst 是 i32，而上一轮的 to_fp32 会把 a 的 dtype 改成 f32
-      // → 这里必须每块重设 dtype（原代码每次新建 acc 所以不需要）。
-      a.set_dtype(AccDType::I32);
-      t.widen(a);                              // i8 → i32
-      a.to_fp32();
-      a.mul(esv, true);
-      store_acc_at(a, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
-                      k * static_cast<std::uint32_t>(out.col_bytes));
+      set_zone(af, nr, nc);
+      set_len(esv, nr);
+      t.dequant(esv, af);                      // af = f32(t) * esv[i]（tdequant）
+      store_acc_at(af, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
+                       k * static_cast<std::uint32_t>(out.col_bytes));
     }
   }
 }
@@ -117,6 +121,14 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
   Vec32 esv{};
   esv.set_dtype(Vec32DType::F32);
   esv.set_stride(scale.row_bytes);
+  Acc af{};                                    // f32 输出（adequant 的 dst）
+  af.set_strides(tmp.row_bytes, tmp.col_bytes);
+  af.set_dtype(AccDType::F32);
+  Vec32 ones{};                                // vCol = 1
+  ones.set_dtype(Vec32DType::F32);
+  ones.set_stride(4);
+  set_len(ones, kBlock);
+  ones.fill(1.0f);
   Vec32 ss{};
   ss.set_dtype(Vec32DType::F32);
   Vec32 wv{};
@@ -140,17 +152,16 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
       set_zone(t, nr, nc);
       t.set_data(table.data + k * static_cast<std::uint32_t>(table.col_bytes));
       t.gather_from_vec(idv);
-      set_zone(a, nr, nc);
-      a.set_dtype(AccDType::I32);
-      t.widen(a);
-      a.to_fp32();
-      a.mul(esv, true);
-      store_acc_at(a, tmp.data + m * static_cast<std::uint32_t>(tmp.row_bytes) +
+      set_zone(af, nr, nc);
+      set_len(esv, nr);
+      t.dequant(esv, af);                      // af = f32(t) * esv[i]（tdequant）
+      store_acc_at(af, tmp.data + m * static_cast<std::uint32_t>(tmp.row_bytes) +
                       k * static_cast<std::uint32_t>(tmp.col_bytes));
+      // sumsq 要在**缩放后的 f32**上做（af），不是在 i32 的 a 上
       if (k == 0) {
-        ss = a.row_sum_sq();
+        ss = af.row_sum_sq();
       } else {
-        a.row_sum_sq(ss);
+        af.row_sum_sq(ss);
       }
     }
     ss.mul(inv);

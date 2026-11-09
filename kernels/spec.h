@@ -96,7 +96,6 @@ YAI_OP_INLINE void copy_state_4k(std::byte *dst, std::byte *src, std::uint32_t b
   a.set_strides(128, 4);
   a.set_dtype(AccDType::F32);
   a.set_valid_zone(32, 32);
-  a.set_layout_row_major();
   for (std::uint32_t off = 0; off < bytes; off += 4096) {
     a.set_data(src + off);
     a.load();

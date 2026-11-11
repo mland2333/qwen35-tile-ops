@@ -1,9 +1,11 @@
 [
   {
+    "directory": "/nfs/home/maole/npu/qwen35-tile-ops",
+    "file": "/nfs/home/maole/npu/qwen35-tile-ops/src/main.cpp",
     "arguments": [
-      "../llvm-project/build/bin/clang++",
+      "/nfs/home/maole/npu/llvm-project/build/bin/clang-21",
       "--target=riscv64-unknown-elf",
-      "-march=rv64im_xaicore",
+      "-march=rv64im",
       "-mabi=lp64",
       "-ffixed-x30",
       "-ffixed-x31",
@@ -21,12 +23,26 @@
       "-I",
       "config",
       "-c",
+      "src/main.cpp",
       "-o",
-      "build/main.o",
-      "src/main.cpp"
-    ],
+      "build/main.o"
+    ]
+  },
+  {
     "directory": "/nfs/home/maole/npu/qwen35-tile-ops",
-    "file": "/nfs/home/maole/npu/qwen35-tile-ops/src/main.cpp",
-    "output": "/nfs/home/maole/npu/qwen35-tile-ops/build/main.o"
+    "file": "/nfs/home/maole/npu/qwen35-tile-ops/tools/sim_bridge.cpp",
+    "arguments": [
+      "g++",
+      "-std=c++20",
+      "-O2",
+      "-I",
+      "/nfs/home/maole/npu/Tile-NPU-Sim/include",
+      "-I",
+      "/nfs/home/maole/npu/Tile-NPU-Sim/src",
+      "-c",
+      "tools/sim_bridge.cpp",
+      "-o",
+      "build/sim_bridge_main.o"
+    ]
   }
 ]

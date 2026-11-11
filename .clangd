@@ -5,10 +5,6 @@
 # 标准 rv64im —— 只影响 IDE 的解析，不影响真实构建（Makefile 用自己的 flags）。
 CompileFlags:
   CompilationDatabase: .
-  Remove:
-    - -march=rv64im_xaicore
-  Add:
-    - -march=rv64im
 Index:
   Background: Build
 InlayHints:

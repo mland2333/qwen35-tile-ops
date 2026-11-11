@@ -48,10 +48,8 @@ header blob: $(HDR) $(BLOB)
 
 # 给 IDE 用的 compile_commands.json（clangd / VS Code 的跳转依赖它）。
 # 用 bear 截获真实编译命令，再手工清掉 clangd 不认识的 -march（见 .clangd）。
-compile_commands: $(BUILD)/main.o
-	rm -f $(BUILD)/main.o $(BUILD)/main.o.link
-	bear --output compile_commands.json -- $(MAKE) $(BUILD)/main.o
-	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/main.o $(BUILD)/main.o.link
+compile_commands: tools/gen_compile_commands.py
+	$(PY) tools/gen_compile_commands.py
 
 $(BUILD)/main.o: src/main.cpp $(KERNELS) $(HDR) | $(BUILD)
 	$(CLANG) $(TARGET) $(INC) -c $< -o $@

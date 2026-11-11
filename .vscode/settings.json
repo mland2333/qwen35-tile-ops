@@ -1,0 +1,16 @@
+{
+  // 用 clangd 做 C++ 的语言服务（比 Microsoft C++ 扩展更懂交叉编译 + 自定义 builtin）
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}",
+    "--background-index",
+    "--header-insertion=never",
+    "--completion-style=detailed",
+    "--pch-storage=memory"
+  ],
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "files.associations": {
+    "*.h": "cpp",
+    "*.inc": "cpp"
+  },
+  "editor.formatOnSave": false
+}

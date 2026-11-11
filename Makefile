@@ -27,7 +27,7 @@ HDR       := config/model_qwen35.h
 BLOB      := $(BUILD)/qwen35_data.bin
 GUEST     := $(BUILD)/qwen35.bin
 
-.PHONY: all pqw header blob guest check clean stats bridge dump chat
+.PHONY: all pqw header blob guest check clean stats bridge dump chat compile_commands
 
 all: $(GUEST)
 
@@ -45,6 +45,13 @@ $(HDR) $(BLOB): $(PQW) tools/convert_pqwf35.py tools/ref_qwen35.py
 	$(PY) tools/convert_pqwf35.py --pqwf $(PQW) --header $(HDR) --blob $(BLOB)
 
 header blob: $(HDR) $(BLOB)
+
+# 给 IDE 用的 compile_commands.json（clangd / VS Code 的跳转依赖它）。
+# 用 bear 截获真实编译命令，再手工清掉 clangd 不认识的 -march（见 .clangd）。
+compile_commands: $(BUILD)/main.o
+	rm -f $(BUILD)/main.o $(BUILD)/main.o.link
+	bear --output compile_commands.json -- $(MAKE) $(BUILD)/main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/main.o $(BUILD)/main.o.link
 
 $(BUILD)/main.o: src/main.cpp $(KERNELS) $(HDR) | $(BUILD)
 	$(CLANG) $(TARGET) $(INC) -c $< -o $@

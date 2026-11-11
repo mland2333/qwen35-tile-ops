@@ -1,0 +1,32 @@
+[
+  {
+    "arguments": [
+      "../llvm-project/build/bin/clang++",
+      "--target=riscv64-unknown-elf",
+      "-march=rv64im_xaicore",
+      "-mabi=lp64",
+      "-ffixed-x30",
+      "-ffixed-x31",
+      "-std=c++20",
+      "-O1",
+      "-nostdinc++",
+      "-isystem",
+      "test_include",
+      "-I",
+      "include",
+      "-I",
+      "kernels",
+      "-I",
+      ".",
+      "-I",
+      "config",
+      "-c",
+      "-o",
+      "build/main.o",
+      "src/main.cpp"
+    ],
+    "directory": "/nfs/home/maole/npu/qwen35-tile-ops",
+    "file": "/nfs/home/maole/npu/qwen35-tile-ops/src/main.cpp",
+    "output": "/nfs/home/maole/npu/qwen35-tile-ops/build/main.o"
+  }
+]

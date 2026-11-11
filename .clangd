@@ -1,0 +1,15 @@
+# VS Code / clangd 配置：让算子代码的"跳转到定义/查找引用"可用。
+#
+# 关键点：编译命令里的 -march=rv64im_xaicore 是自定义扩展，clangd 自带的
+# clang 不认识（会报 invalid arch name 并放弃语义分析）。这里把它换成
+# 标准 rv64im —— 只影响 IDE 的解析，不影响真实构建（Makefile 用自己的 flags）。
+CompileFlags:
+  CompilationDatabase: .
+  Remove:
+    - -march=rv64im_xaicore
+  Add:
+    - -march=rv64im
+Index:
+  Background: Build
+InlayHints:
+  Enabled: true

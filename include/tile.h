@@ -209,6 +209,18 @@ struct Tile {
     YAI_COMPILER_INTRINSIC(tile_matmul)(value_, yai_handle(right),
                                         yai_handle(acc), zero, lt, rt);
   }
+  // matmul + drain：只用于最后一个 K 块。
+  //   acc_i32 : 预先配好 dtype=i32、rows/cols；mma 的最后一块写入它。
+  //   out_f32 : 预先配好 dtype=f32、与 acc_i32 相同的 rows/cols；必须与
+  //             acc_i32 是不同 Acc（adequant 的源/目的约束）。
+  //   vcol/vrow: f32 Vec32，len 分别为 out 的 cols/rows。
+  // 语义等价于 matmul(right, acc_i32, ...) + adequant(out_f32, acc_i32,
+  // vcol, vrow)。当前是普通 Tile 函数，编译器只保证依赖顺序；若要保证两条
+  // 指令相邻/可被硬件 drain 融合，需要后续的 builtin + pseudo。
+  YAI_ALWAYS_INLINE void matmul_dequant(const Tile &right, Acc &acc_i32,
+                                        Acc &out_f32, const Vec32 &vcol,
+                                        const Vec32 &vrow, bool zero, bool lt,
+                                        bool rt) const;
   // tdequant.rows.f32：out[i,j] = f32(tile[i,j]) * scale[i]。
   // 与 widen 一样写进调用方配置好的 Acc（dtype=f32、zone=tile 形状）。
   YAI_ALWAYS_INLINE void dequant(const Vec32 &scale, Acc &out) const;
@@ -570,6 +582,15 @@ YAI_ALWAYS_INLINE void adequant(Acc &dst, const Acc &src, const Vec32 &col,
                                 const Vec32 &row) {
   YAI_COMPILER_INTRINSIC(acc_adequant)(yai_handle(dst), yai_handle(src),
                                        yai_handle(col), yai_handle(row));
+}
+
+YAI_ALWAYS_INLINE void Tile::matmul_dequant(const Tile &right, Acc &acc_i32,
+                                              Acc &out_f32, const Vec32 &vcol,
+                                              const Vec32 &vrow, bool zero,
+                                              bool lt, bool rt) const {
+  // matmul 目前是非 const 接口，但只读 right；这里保持现有签名不变。
+  matmul(const_cast<Tile &>(right), acc_i32, zero, lt, rt);
+  adequant(out_f32, acc_i32, vcol, vrow);
 }
 
 // 返回新逻辑值的操作：返回值本身将来由 intrinsic 降为新的 Acc/Vec32 SSA 值。

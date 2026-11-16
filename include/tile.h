@@ -318,17 +318,11 @@ struct Acc {
                               float value = -3.402823466e+38F) {
     YAI_COMPILER_INTRINSIC(acc_mask)(value_, diag, value);
   }
-  YAI_ALWAYS_INLINE void quant(Vec32 &max, Tile &tile) {
-    YAI_COMPILER_INTRINSIC(acc_quant)(value_, yai_handle(max),
-                                      yai_handle(tile));
-  }
-  // 用给定的 per-row scale 量化（不修改 scale），对应 tquantx.rows。
+  // 用给定的 per-row scale 量化（不修改 scale），对应 aquant.rows.q8s32
+  // 的显式 scale 形式。
   YAI_ALWAYS_INLINE void quant_ext(Vec32 &scale, Tile &tile) {
     YAI_COMPILER_INTRINSIC(acc_quant_ext)(value_, yai_handle(scale),
                                           yai_handle(tile));
-  }
-  YAI_ALWAYS_INLINE void to_fp32() {
-    YAI_COMPILER_INTRINSIC(acc_to_fp32)(value_);
   }
 
   YAI_ALWAYS_INLINE void add(const Acc &b) {
@@ -339,9 +333,6 @@ struct Acc {
   }
   YAI_ALWAYS_INLINE void mul(const Acc &b) {
     YAI_COMPILER_INTRINSIC(acc_mul_inplace)(value_, yai_handle(b));
-  }
-  YAI_ALWAYS_INLINE void div(const Acc &b) {
-    YAI_COMPILER_INTRINSIC(acc_div_inplace)(value_, yai_handle(b));
   }
   YAI_ALWAYS_INLINE void add(float value) {
     YAI_COMPILER_INTRINSIC(acc_add_scalar)(value_, value);
@@ -377,9 +368,6 @@ struct Acc {
   }
   YAI_ALWAYS_INLINE void mul(const Vec32 &v, bool col = true) {
     YAI_COMPILER_INTRINSIC(acc_mul_vec)(value_, yai_handle(v), col);
-  }
-  YAI_ALWAYS_INLINE void div(const Vec32 &v, bool col = true) {
-    YAI_COMPILER_INTRINSIC(acc_div_vec)(value_, yai_handle(v), col);
   }
 
   YAI_ALWAYS_INLINE Vec32 row_max() const;
@@ -531,9 +519,6 @@ struct Vec32 {
   YAI_ALWAYS_INLINE void mul(const Vec32 &b) {
     YAI_COMPILER_INTRINSIC(vec32_mul)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void div(const Vec32 &b) {
-    YAI_COMPILER_INTRINSIC(vec32_div)(value_, yai_handle(b));
-  }
   YAI_ALWAYS_INLINE void add(float value) {
     YAI_COMPILER_INTRINSIC(vec32_add_scalar)(value_, value);
   }
@@ -591,10 +576,6 @@ YAI_ALWAYS_INLINE void adequant(Acc &dst, const Acc &src, const Vec32 &col,
 YAI_ALWAYS_INLINE void Tile::dequant(const Vec32 &scale, Acc &out) const {
   YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), yai_handle(out));
 }
-YAI_ALWAYS_INLINE void Tile::widen(Acc &out) const {
-  YAI_COMPILER_INTRINSIC(tile_widen)(value_, yai_handle(out));
-}
-
 YAI_ALWAYS_INLINE Vec32 Acc::row_max() const {
   return Vec32(YAI_COMPILER_INTRINSIC(acc_row_max)(value_));
 }
@@ -639,9 +620,6 @@ YAI_ALWAYS_INLINE Acc sub(const Acc &a, const Acc &b) {
 YAI_ALWAYS_INLINE Acc mul(const Acc &a, const Acc &b) {
   return Acc(YAI_COMPILER_INTRINSIC(acc_mul)(yai_handle(a), yai_handle(b)));
 }
-YAI_ALWAYS_INLINE Acc div(const Acc &a, const Acc &b) {
-  return Acc(YAI_COMPILER_INTRINSIC(acc_div)(yai_handle(a), yai_handle(b)));
-}
 YAI_ALWAYS_INLINE Acc operator+(const Acc &a, const Acc &b) {
   return add(a, b);
 }
@@ -650,9 +628,6 @@ YAI_ALWAYS_INLINE Acc operator-(const Acc &a, const Acc &b) {
 }
 YAI_ALWAYS_INLINE Acc operator*(const Acc &a, const Acc &b) {
   return mul(a, b);
-}
-YAI_ALWAYS_INLINE Acc operator/(const Acc &a, const Acc &b) {
-  return div(a, b);
 }
 
 #undef YAI_COMPILER_INTRINSIC
